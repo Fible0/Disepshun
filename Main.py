@@ -18,7 +18,8 @@ class Disepshun(ShowBase):
         wp.setZOrder(WindowProperties.Z_top)
         wp.setCursorHidden(True)
         self.win.requestProperties(wp)
-        self.center_mouse() 
+        if not user32: self.set_x11_icon()
+        self.center_mouse()
         self.win.setClearColor((0, 0, 0, 1))
         
         self.cam.node().getLens().setNear(0.1)
@@ -143,6 +144,30 @@ class Disepshun(ShowBase):
         parts = [p for n, p in [(self.OLD_MAP, "map"), (self.OLD_SETTINGS, "settings")] if n in moved]
         if len(moved) > len(parts): parts.append("map backups")
         return "Imported old " + (", ".join(parts[:-1]) + " and " if len(parts) > 1 else "") + parts[-1]
+
+    def set_x11_icon(self):
+        # Panda3D's X11 window ignores icon-filename, so set _NET_WM_ICON directly
+        try:
+            import ctypes.util
+            x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XInternAtom.restype = ctypes.c_ulong
+            x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+            x11.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+            x11.XFlush.argtypes = x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            img = PNMImage(Filename.fromOsSpecific(os.path.join(ROOT_DIR, "assets", "icon.png")))
+            iw, ih = img.getXSize(), img.getYSize()
+            data = [iw, ih] + [(img.getAlphaVal(x, y) << 24) | (img.getRedVal(x, y) << 16) | (img.getGreenVal(x, y) << 8) | img.getBlueVal(x, y)
+                               for y in range(ih) for x in range(iw)]
+            arr = (ctypes.c_ulong * len(data))(*data)  # format-32 X properties are C longs
+            dpy = x11.XOpenDisplay(None)
+            if not dpy: return
+            win = self.win.getWindowHandle().getIntHandle()
+            x11.XChangeProperty(dpy, win, x11.XInternAtom(dpy, b"_NET_WM_ICON", 0), 6, 32, 0, arr, len(data))  # 6 = CARDINAL, 0 = replace
+            x11.XFlush(dpy); x11.XCloseDisplay(dpy)
+        except Exception:
+            traceback.print_exc()
 
     def center_mouse(self):
         cx, cy = self.win.getXSize() // 2, self.win.getYSize() // 2
