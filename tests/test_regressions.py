@@ -398,6 +398,20 @@ def import_old(tmp):
     assert a.physics.player.getPos()==V(0,0,1)
     print('  map, settings and backups moved; current map and same-named backup kept as .bak; map and settings reloaded')
 
+@proof('B26 coyote time: a jump just after walking off a ledge still works, but only once and only briefly')
+def coyote(tmp):
+    dt=.016; space=dict(KEYS, space=True)
+    def off_ledge():
+        w=world(tmp); cube(w); p=physics(w); p.player.setPos(0,0,1); p.update(dt,KEYS); assert p.ground
+        p.player.setX(.8); p.update(dt,KEYS); assert not p.ground  # stepped off the edge
+        return p
+    p=off_ledge(); p.update(dt,space); assert p.vz>7, p.vz
+    p.update(dt,space); p.update(dt,space); assert p.vz<p.jump-2*abs(p.g)*dt+1e-6, p.vz  # no second jump
+    p=off_ledge()
+    for _ in range(int(p.coyote_time/dt)+1): p.update(dt,KEYS)
+    p.update(dt,space); assert p.vz<0, p.vz
+    print('  jump 1 frame after leaving the ledge works; no double jump; jump after the window fails')
+
 if __name__=='__main__':
     failures=[]
     print('Source classes only; no Config execution, ShowBase, graphics pipe, window, or game loop.')

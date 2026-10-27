@@ -14,6 +14,7 @@ class PlayerPhysics:
         self.curr_h = self.h_stand
         self.head_stand = 1.5; self.head_crouch = 0.8; self.head.setZ(self.head_stand)
         self.vz = 0; self.g = -19.6; self.jump = 8.0; self.ground = False
+        self.coyote_time = 0.1; self.coyote = 0.0 # Seconds after leaving a ledge that a jump still works
         self.max_step = 0.25 # Largest movement per collision test, well under a block or the player's width
         self.flying = False; self.fly_speed = 10.0; self.god_mode = False
         self.checkpoint = VBase3(0, 0, 1); self.just_respawned = False
@@ -43,7 +44,7 @@ class PlayerPhysics:
         self.player.setPos(self.checkpoint)
         self.player.setHpr(0, 0, 0)
         self.camera.setP(0)
-        self.vz = 0; self.ground = False; self.just_respawned = True; self.start_cyan_effect()
+        self.vz = 0; self.ground = False; self.coyote = 0.0; self.just_respawned = True; self.start_cyan_effect()
         
         if hasattr(builtins, 'base'):
             win = builtins.base.win
@@ -212,12 +213,13 @@ class PlayerPhysics:
             self.head.setZ(self.head.getZ() + (t_head - self.head.getZ()) * dt * 7.0)
             self.player_height = self.curr_h
 
-            if keys["space"] and self.ground: self.vz = self.jump; self.ground = False
+            if keys["space"] and (self.ground or self.coyote > 0): self.vz = self.jump; self.ground = False; self.coyote = 0.0
             self.vz += self.g * dt
             dz = self.vz * dt; steps = max(1, math.ceil(abs(dz) / self.max_step))
             for _ in range(steps):
                 if self.vertical_step(dz / steps, keys): break
             if self.just_respawned: return
+            self.coyote = self.coyote_time if self.ground else max(0.0, self.coyote - dt)
 
             sp = 2.0 if keys["lcontrol"] else 5.0
             mv = VBase3(0,0,0)
