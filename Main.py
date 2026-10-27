@@ -30,6 +30,11 @@ class Disepshun(ShowBase):
         self.saved_settings = {}
         self.load_settings()
         
+        self.sfx = {}
+        for n in ["walk", "jump", "bounce", "toggle", "place", "break"]:
+            try: self.sfx[n] = self.loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, n + ".mp3")))
+            except Exception: pass
+
         self.world = WorldManager(self.render, self.loader)
         self.physics = PlayerPhysics(self.render, self.camera, self.world)
         
@@ -40,7 +45,7 @@ class Disepshun(ShowBase):
         self.hotbar_page = 0 # 0 = Blocks, 1 = Tools
         
         self.selected_movers = []; self.selected_trampolines = []
-        self.wp_node = None; self.wp_markers = []
+        self.wp_node = None; self.wp_markers = []; self.bounce_ghosts = []
         self.is_focused = True; self.menu_open = False; self.paused = False
         self.preview_enabled = True; self.preview_shading = True; self.cur_bounce = 1.3; self.cur_h = 0.0
         self.fly_text_timer = 0.0
@@ -107,44 +112,6 @@ class Disepshun(ShowBase):
                 json.dump(self.saved_settings, f, indent=4)
         except: pass
 
-    OLD_MAP, OLD_SETTINGS = "map_save.txt", "Settings.json"
-
-    def old_save_files(self):
-        """Map, settings and map backups that older versions kept in the game folder."""
-        try: names = os.listdir(ROOT_DIR)
-        except OSError: return []
-        baks = sorted(n for n in names if n.startswith(self.OLD_MAP + ".") and n.endswith(".bak"))
-        return [n for n in [self.OLD_MAP, self.OLD_SETTINGS] + baks if os.path.isfile(os.path.join(ROOT_DIR, n))]
-
-    def import_old_save(self):
-        """Moves an older version's save into data/ and reloads it. Returns a message for the menu."""
-        old = self.old_save_files()
-        if not old: return "No old save found"
-        if not self.world.flush_saves(5): return "Import cancelled: the current map could not be saved"
-        map_file = self.world.save_file; moved = []; error = None
-        try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            # Keep the current map so importing can never lose it
-            if self.OLD_MAP in old and os.path.exists(map_file): shutil.copy2(map_file, self.world.backup_name(map_file))
-            for n in old:
-                dest = {self.OLD_MAP: map_file, self.OLD_SETTINGS: self.settings_file}.get(n, os.path.join(DATA_DIR, n))
-                if n not in (self.OLD_MAP, self.OLD_SETTINGS) and os.path.exists(dest): dest = self.world.backup_name(map_file)
-                os.replace(os.path.join(ROOT_DIR, n), dest); moved.append(n)
-        except OSError as e:
-            error = f"Import failed: {e}"
-        if self.OLD_MAP in moved:
-            self.deselect_movers(); self.deselect_trampolines()
-            self.world.save_blocked = False; self.world.save_error = None; self.world.map_is_dirty = False
-            self.world.load_map()
-            self.physics.checkpoint = self.world.saved_checkpoint_pos + VBase3(0, 0, 1) if self.world.saved_checkpoint_pos else VBase3(0, 0, 1)
-            self.physics.player.setPos(self.physics.checkpoint); self.physics.vz = 0
-        if self.OLD_SETTINGS in moved:
-            self.load_settings(); self.ui.apply_settings()
-        if error: return error
-        parts = [p for n, p in [(self.OLD_MAP, "map"), (self.OLD_SETTINGS, "settings")] if n in moved]
-        if len(moved) > len(parts): parts.append("map backups")
-        return "Imported old " + (", ".join(parts[:-1]) + " and " if len(parts) > 1 else "") + parts[-1]
-
     def set_x11_icon(self):
         # Panda3D's X11 window ignores icon-filename, so set _NET_WM_ICON directly
         try:
@@ -173,12 +140,14 @@ class Disepshun(ShowBase):
         cx, cy = self.win.getXSize() // 2, self.win.getYSize() // 2
         self.win.movePointer(0, cx, cy)
 
+    CUBE_FACES = [((0, -0.5, 0), 180, 0), ((0, 0.5, 0), 0, 0), ((-0.5, 0, 0), -90, 0), ((0.5, 0, 0), 90, 0), ((0, 0, 0.5), 0, -90), ((0, 0, -0.5), 0, 90)]
+    GHOST_FIRST = (1, 0.7, 0.15); GHOST_MAX = (0.7, 0.35, 1) # Amber: first bounce, violet: highest bounce
+
     def create_preview(self):
         self.preview = NodePath("preview")
         self.preview.reparentTo(self.render)
-        
-        face_data = [((0, -0.5, 0), 180, 0), ((0, 0.5, 0), 0, 0), ((-0.5, 0, 0), -90, 0), ((0.5, 0, 0), 90, 0), ((0, 0, 0.5), 0, -90), ((0, 0, -0.5), 0, 90)]
-        for pos, h, p in face_data:
+
+        for pos, h, p in self.CUBE_FACES:
             f = self.world.face_node.copyTo(self.preview)
             f.setPos(pos); f.setHpr(h, p, 0); f.setTwoSided(True)
             
@@ -187,6 +156,39 @@ class Disepshun(ShowBase):
         self.preview.setDepthOffset(1)
         # Lighting/Shader state set by toggle_preview_shading
         self.preview.hide()
+
+    def make_ghost(self, color):
+        """Bottom half of the player's hitbox, feet at the node's origin: see-through faces with solid edges."""
+        w = self.physics.w; h = self.physics.h_stand / 2
+        g = self.render.attachNewNode("bounce_ghost")
+        body = g.attachNewNode("body"); body.setScale(w, w, h); body.setZ(h / 2)
+        for pos, hh, p in self.CUBE_FACES:
+            f = self.world.face_node.copyTo(body)
+            f.setPos(pos); f.setHpr(hh, p, 0); f.setTwoSided(True)
+        body.setColor(*color, 0.25); body.setDepthWrite(False)
+        ls = LineSegs(); ls.setColor(*color, 0.85); ls.setThickness(2.0)
+        x, y = w / 2, w / 2
+        for z in (0, h):
+            ls.moveTo(-x, -y, z); ls.drawTo(x, -y, z); ls.drawTo(x, y, z); ls.drawTo(-x, y, z); ls.drawTo(-x, -y, z)
+        for cx, cy in ((-x, -y), (x, -y), (x, y), (-x, y)): ls.moveTo(cx, cy, 0); ls.drawTo(cx, cy, h)
+        g.attachNewNode(ls.create())
+        g.setTransparency(TransparencyAttrib.MAlpha); g.setBin("transparent", 0)
+        g.setLightOff(1); g.setShaderOff(1); g.setTextureOff(1)
+        return g
+
+    def update_bounce_ghosts(self):
+        ts = [t for t in self.selected_trampolines if not t.isEmpty()] if self.tool_mode == 5 else []
+        fps = globalClock.getAverageFrameRate(); dt = 1 / round(fps) if fps >= 1 else 1 / 60
+        while len(self.bounce_ghosts) < len(ts): self.bounce_ghosts.append((self.make_ghost(self.GHOST_FIRST), self.make_ghost(self.GHOST_MAX)))
+        for i, (first, top) in enumerate(self.bounce_ghosts):
+            if i >= len(ts): first.hide(); top.hide(); continue
+            fh, mh = self.physics.bounce_heights(ts[i], dt)
+            base = ts[i].getPos(self.render) + VBase3(0, 0, 0.5)
+            first.setPos(base + VBase3(0, 0, fh)); first.show()
+            # When the first bounce is already the highest, one ghost marks both
+            top.setPos(base + VBase3(0, 0, mh))
+            if mh - fh > 0.01: top.show()
+            else: top.hide()
 
     def setup_ray(self):
         self.cTrav = CollisionTraverser(); self.cHandler = CollisionHandlerQueue()
@@ -251,6 +253,11 @@ class Disepshun(ShowBase):
 
     def toggle_sound(self, v): 
         self.sound_enabled = v
+
+    def play_sfx(self, name, rate=1.0, volume=1.0):
+        s = self.sfx.get(name)
+        if not s or not self.sound_enabled: return
+        s.stop(); s.setPlayRate(rate); s.setVolume(volume); s.play()
 
     def toggle_particles(self, v): 
         self.particles_enabled = v
@@ -535,7 +542,8 @@ class Disepshun(ShowBase):
                 self.preview.hide()
         else: 
             self.preview.hide()
-        
+
+        self.update_bounce_ghosts()
         self.world.update_chunks()
         self.world.retry_save(t)
         if self.world.save_error != self.shown_save_error:
@@ -629,6 +637,7 @@ class Disepshun(ShowBase):
             self.world.register_cube(c)
             self.world.request_chunk_update(pos)
         self.world.map_is_dirty = True; self.world.save_map()
+        self.play_sfx("place", random.uniform(0.95, 1.05))
 
         pos = c.getPos(); pp = self.physics.player.getPos()
         if abs(pp.x - pos.x) < 0.9 and abs(pp.y - pos.y) < 0.9 and pp.z < pos.z + 0.5 and pp.z + self.physics.player_height > pos.z - 0.5:
@@ -659,6 +668,7 @@ class Disepshun(ShowBase):
                 # Checkpoint block gone: fall back to the default spawn
                 if was_cp: self.physics.checkpoint = VBase3(0, 0, 1)
                 self.world.map_is_dirty = True; self.world.save_map()
+                self.play_sfx("break", random.uniform(0.95, 1.05))
 
 try:
     app = Disepshun()

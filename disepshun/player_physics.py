@@ -14,11 +14,13 @@ class PlayerPhysics:
         self.curr_h = self.h_stand
         self.head_stand = 1.5; self.head_crouch = 0.8; self.head.setZ(self.head_stand)
         self.vz = 0; self.g = -19.6; self.jump = 8.0; self.ground = False
+        self.bounce_cache = {} # (bounciness, max height, frame time) -> (first, highest) bounce heights
         self.coyote_time = 0.1; self.coyote = 0.0 # Seconds after leaving a ledge that a jump still works
         self.max_step = 0.25 # Largest movement per collision test, well under a block or the player's width
         self.flying = False; self.fly_speed = 10.0; self.god_mode = False
         self.checkpoint = VBase3(0, 0, 1); self.just_respawned = False
         self.checkpoint_pitch = 1.0
+        self.step_dist = 0.0; self.step_len = 1.6 # Ground distance between footstep sounds
         self.particles = ParticleSystem(self.render)
         try: self.respawn_sfx = loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, "respawn.mp3")))
         except: self.respawn_sfx = None
@@ -173,12 +175,47 @@ class PlayerPhysics:
             nv = abs(self.vz) * b; cap = math.sqrt(2 * abs(self.g) * mh) if mh > 0 else 11.0
             self.vz = min(nv, cap) if mh > 0 else nv
             self.player.setZ(hgz + 0.01); self.ground = False
+            builtins.base.play_sfx("bounce", random.uniform(0.95, 1.05))
             return True
         if hgz > -10000:
             self.player.setZ(hgz); self.vz = 0; self.ground = True
             return True
         self.player.setPos(pp); self.ground = False
         return False
+
+    def bounce_heights(self, c, dt):
+        """Feet heights above trampoline c's top, holding space at frame time dt: the first bounce after a standing jump, and the highest bounce reachable."""
+        b = self.tag_num(c, "bounciness", 1.3, 0.1); mh = self.tag_num(c, "max_height", 0.0, 0.0)
+        key = (b, mh, round(dt, 4))
+        if (r := self.bounce_cache.get(key)) is None:
+            r = self.bounce_cache[key] = self.sim_bounces(b, mh, min(dt, 0.1))
+        ceiling = 1000 - (c.getZ(self.render) + 0.5) # Out of bounds above z 1000 stops the player like a ceiling
+        return min(r[0], ceiling), min(r[1], ceiling)
+
+    def sim_bounces(self, b, mh, dt):
+        """Bounce apexes with update()'s stepping (gravity applied before each frame's move), solved per flight instead of per frame."""
+        gdt = abs(self.g) * dt
+        cap = math.sqrt(2 * abs(self.g) * mh) if mh > 0 else float('inf')
+        def apex(v, z0):
+            k = math.floor(v / gdt)
+            return z0 + dt * (k * v - gdt * k * (k + 1) / 2)
+        def impact(v, z0):
+            # First frame k whose end height is below the top: z0 + dt*(k*v - gdt*k*(k+1)/2) < 0
+            a = gdt / 2; bq = gdt / 2 - v
+            k = max(1, math.floor((-bq + math.sqrt(bq * bq + 4 * a * z0 / dt)) / (2 * a)) - 1)
+            while z0 + dt * (k * v - gdt * k * (k + 1) / 2) >= 0: k += 1
+            return k * gdt - v
+        # The standing jump counts toward the highest point: weak trampolines bounce lower than it
+        v = impact(self.jump, 0.0); first = None; last = top = apex(self.jump, 0.0)
+        for _ in range(2000):
+            if v <= 4.0: break # Too slow to bounce: the player lands and jumps again, repeating the same bounces
+            launch = min(v * b, cap); h = apex(launch, 0.01)
+            if first is None: first = h
+            elif h <= last + 1e-6: break # No longer climbing
+            last = h; top = max(top, h)
+            if top > 2000: return first, float('inf')
+            v = impact(launch, 0.01)
+        return (first if first is not None else 0.0), top
 
     @staticmethod
     def tag_num(c, tag, default, lo):
@@ -213,7 +250,9 @@ class PlayerPhysics:
             self.head.setZ(self.head.getZ() + (t_head - self.head.getZ()) * dt * 7.0)
             self.player_height = self.curr_h
 
-            if keys["space"] and (self.ground or self.coyote > 0): self.vz = self.jump; self.ground = False; self.coyote = 0.0
+            if keys["space"] and (self.ground or self.coyote > 0):
+                self.vz = self.jump; self.ground = False; self.coyote = 0.0
+                builtins.base.play_sfx("jump", random.uniform(0.95, 1.05))
             self.vz += self.g * dt
             dz = self.vz * dt; steps = max(1, math.ceil(abs(dz) / self.max_step))
             for _ in range(steps):
@@ -229,6 +268,7 @@ class PlayerPhysics:
             if keys["d"]: mv.x += 1
             if mv.lengthSquared() > 0:
                 ov = self.player.getQuat().xform(mv.normalized()) * sp * dt
+                start = self.player.getPos()
                 
                 next_x = self.player.getPos() + VBase3(ov.x, 0, 0)
                 if not self.check_collision(next_x, self.player_height): 
@@ -247,3 +287,10 @@ class PlayerPhysics:
                             can_move = False
                     if can_move:
                         if not self.just_respawned: self.player.setY(self.player.getY() + ov.y)
+
+                if self.ground and not self.just_respawned:
+                    d = self.player.getPos() - start; self.step_dist += math.hypot(d.x, d.y)
+                    if self.step_dist >= self.step_len * (0.5 if keys["lcontrol"] else 1.0):
+                        self.step_dist = 0.0
+                        builtins.base.play_sfx("walk", random.uniform(0.85, 1.15), 0.15 if keys["lcontrol"] else 0.3)
+            else: self.step_dist = self.step_len * 0.7 # First step sounds soon after starting to walk

@@ -33,7 +33,7 @@ for path in [SRC / 'particle_system.py', SRC / 'world_manager.py', SRC / 'player
 World, Physics, App = (G[n] for n in ['WorldManager', 'PlayerPhysics', 'Disepshun'])
 V, NP = core.VBase3, core.NodePath
 G['random'] = __import__('random')
-builtins.base = NS(camera=NP("base-camera"), particles_enabled=False, sound_enabled=False,
+builtins.base = NS(camera=NP("base-camera"), particles_enabled=False, sound_enabled=False, play_sfx=lambda *a: None,
                    win=NS(getXSize=lambda: 100, getYSize=lambda: 100, movePointer=lambda *a: None))
 G['globalClock'] = NS(getDt=lambda: 0.1)
 KEYS = dict.fromkeys(['w','s','a','d','space','lcontrol'], False)
@@ -65,7 +65,7 @@ def mover(w, pos=(0,0,0.5), material='1', wp=(5,0,0.5)):
 def physics(w): return Physics(w.render, NP('camera'), w)
 
 def app(w):
-    a = App.__new__(App); a.world=w; a.render=w.render; a.physics=physics(w)
+    a = App.__new__(App); a.sfx={}; a.sound_enabled=False; a.world=w; a.render=w.render; a.physics=physics(w)
     a.preview=NP('preview'); a.preview.setZ(.5); a.tool_mode=1; a.build_material=1; a.spawned_cube_count=0
     a.cur_bounce=1.3; a.cur_h=0.; a.selected_movers=[]; a.selected_trampolines=[]
     a.paused=False; a.menu_open=False; a.is_focused=True; a.saved_settings={}; a.update_hud=lambda: None; a.draw_wp=lambda: None
@@ -380,23 +380,6 @@ w.save_map()
     w2=world(tmp); w2.cubes=[]; assert w2.flush_saves(5) is True
     print('  delayed writer finished before exit; interrupted write left previous save intact')
 
-@proof('B25 old save in the game folder is imported into data/ without losing the current map')
-def import_old(tmp):
-    root=Path(tmp)/'game'; data=root/'data'; data.mkdir(parents=True)
-    w=world(tmp); w.save_file=str(data/'map_save.txt'); cube(w); save(w); current=Path(w.save_file).read_text()
-    (root/'map_save.txt').write_text('5,0,0.5,1\n6,0,0.5,4\n'); (root/'Settings.json').write_text('{"Sound": false}')
-    (root/'map_save.txt.20250101-000000.bak').write_text('old backup'); (data/'map_save.txt.20250101-000000.bak').write_text('newer backup')
-    a=app(w); a.settings_file=str(data/'settings.json'); applied=[]; a.ui=NS(apply_settings=lambda: applied.append(a.saved_settings))
-    with patch.dict(G, ROOT_DIR=str(root), DATA_DIR=str(data)):
-        assert a.old_save_files()==['map_save.txt','Settings.json','map_save.txt.20250101-000000.bak']
-        msg=a.import_old_save(); assert msg=='Imported old map, settings and map backups', msg
-        assert a.old_save_files()==[] and a.import_old_save()=='No old save found'
-    assert sorted(c.getX() for c in w.cubes)==[5,6] and Path(w.save_file).read_text().startswith('5,0')
-    baks={p.read_text() for p in data.glob('map_save.txt.*.bak')}
-    assert baks=={current,'old backup','newer backup'}, baks
-    assert applied==[{'Sound': False}] and json.loads((data/'settings.json').read_text())=={'Sound': False}
-    assert a.physics.player.getPos()==V(0,0,1)
-    print('  map, settings and backups moved; current map and same-named backup kept as .bak; map and settings reloaded')
 
 @proof('B26 coyote time: a jump just after walking off a ledge still works, but only once and only briefly')
 def coyote(tmp):
@@ -411,6 +394,25 @@ def coyote(tmp):
     for _ in range(int(p.coyote_time/dt)+1): p.update(dt,KEYS)
     p.update(dt,space); assert p.vz<0, p.vz
     print('  jump 1 frame after leaving the ledge works; no double jump; jump after the window fails')
+
+@proof('B27 trampoline ghost heights match the first and highest bounces of a real jump held on it')
+def bounce_ghost(tmp):
+    dt=1/60; space=dict(KEYS, space=True)
+    for b,mh in [(1.3,4.),(1.5,2.),(.8,0.),(1.,0.),(2.,0.)]:
+        w=world(tmp); t=cube(w,material='5'); t.setTag('bounciness',str(b)); t.setTag('max_height',str(mh))
+        p=physics(w); p.player.setPos(0,0,1); p.update(dt,KEYS); assert p.ground
+        first,top=p.bounce_heights(t,dt); apexes=[]; peak=0.; prev=0.
+        for _ in range(int(40/dt)):
+            p.update(dt,space); z=p.player.getZ()-1
+            if p.vz<=0<prev: apexes.append(peak); peak=0.
+            if p.vz>0: peak=max(peak,z)  # highest point of each rise
+            prev=p.vz
+            if len(apexes)>=12: break
+        sim_first=apexes[1]; sim_top=max(apexes)  # apexes[0] is the standing jump
+        if b>1 and mh==0: assert top>990 and sim_top>apexes[1]*1.5, (top,apexes)
+        else: assert abs(sim_top-top)<.02, (b,mh,top,apexes)
+        assert abs(sim_first-first)<.02, (b,mh,first,apexes)
+        print(f'  bounce {b}, max {mh}: first {first:.2f} (sim {sim_first:.2f}), highest {top:.2f} (sim {sim_top:.2f})')
 
 if __name__=='__main__':
     failures=[]

@@ -162,12 +162,10 @@ class GameUI:
             ("Shaders", lambda v: self.base.toggle_shaders(v), True)
         ]
 
-        has_old_save = bool(self.base.old_save_files())
-
         # Calculate exact canvas height based on items to prevent scrolling past content
         start_y = -0.05
         step = 0.11
-        rows = len(opts) + (2 if has_old_save else 0) # Import button and its status line
+        rows = len(opts)
         last_item_y = start_y - ((rows - 1) * step)
         canvas_bottom = last_item_y - 0.06
 
@@ -215,24 +213,6 @@ class GameUI:
                 if val: self.inv_node.show()
                 else: self.inv_node.hide()
 
-        if has_old_save:
-            y = start_y - (len(opts) * step)
-            self.import_btn = DirectButton(parent=self.scroll_frame.getCanvas(), pos=(0, 0, y), text="Import old save", text_scale=0.05, text_pos=(0, -0.015),
-                                           text_fg=(1, 1, 1, 1), frameSize=(-0.3, 0.3, -0.04, 0.04), frameColor=(0.25, 0.25, 0.25, 1), relief=DGG.FLAT, command=self.import_old_save)
-            self.import_status = DirectLabel(parent=self.scroll_frame.getCanvas(), pos=(0, 0, y - step), text="", text_scale=0.04, text_fg=(1, 1, 1, 1),
-                                             text_wordwrap=18, frameColor=(0, 0, 0, 0), state=DGG.DISABLED)
-            self.bind_scroll_events(self.import_btn)
-
-    def import_old_save(self):
-        self.import_status['text'] = self.base.import_old_save()
-        if not self.base.old_save_files(): self.import_btn.hide()
-
-    def apply_settings(self):
-        """Shows and applies saved_settings after they were replaced, without saving them again."""
-        for n, (btn, cb, def_val) in self.switches.items():
-            v = self.base.saved_settings.get(n, def_val)
-            btn.set_value(v); cb(v)
-
     def create_switch(self, parent, label_text, x, y, initial_value, callback):
         btn = DirectButton(parent=parent, pos=(0, 0, y), frameSize=(-0.38, 0.38, -0.04, 0.04), frameColor=(0, 0, 0, 0), relief=DGG.FLAT)
         DirectLabel(parent=btn, text=label_text, scale=0.05, pos=(-0.35, 0, -0.015), text_align=TextNode.ALeft, text_fg=(1, 1, 1, 1), frameColor=(0, 0, 0, 0), state=DGG.DISABLED)
@@ -251,7 +231,9 @@ class GameUI:
             track['frameColor'] = (0.2, 0.8, 0.2, 1) if btn.is_on else (0.2, 0.2, 0.2, 1)
         def toggle():
             set_value(not btn.is_on)
+            if not btn.is_on: self.base.play_sfx("toggle", 0.85) # Before the callback, so switching Sound off still clicks
             callback(btn.is_on)
+            if btn.is_on: self.base.play_sfx("toggle", 1.0)
         btn.set_value = set_value
         btn['command'] = toggle
         
