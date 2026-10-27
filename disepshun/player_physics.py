@@ -1,0 +1,247 @@
+from disepshun.config import *
+from disepshun.particle_system import ParticleSystem
+import builtins
+
+class PlayerPhysics:
+    def __init__(self, render, camera, world_manager):
+        self.render = render
+        self.camera = camera
+        self.world_manager = world_manager
+        self.player = NodePath("Player"); self.player.reparentTo(self.render); self.player.setPos(0, 0, 1)
+        self.head = self.player.attachNewNode("Head"); self.camera.reparentTo(self.head)
+        self.w = 0.4; self.h_stand = 1.67; self.h_crouch = 0.9
+        self.player_height = self.h_stand
+        self.curr_h = self.h_stand
+        self.head_stand = 1.5; self.head_crouch = 0.8; self.head.setZ(self.head_stand)
+        self.vz = 0; self.g = -19.6; self.jump = 8.0; self.ground = False
+        self.max_step = 0.25 # Largest movement per collision test, well under a block or the player's width
+        self.flying = False; self.fly_speed = 10.0; self.god_mode = False
+        self.checkpoint = VBase3(0, 0, 1); self.just_respawned = False
+        self.checkpoint_pitch = 1.0
+        self.particles = ParticleSystem(self.render)
+        try: self.respawn_sfx = loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, "respawn.mp3")))
+        except: self.respawn_sfx = None
+        try: self.checkpoint_sfx = loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, "checkpoint.mp3")))
+        except: self.checkpoint_sfx = None
+
+    def start_cyan_effect(self):
+        if hasattr(builtins.base, 'particles_enabled') and not builtins.base.particles_enabled: return
+        q = self.camera.getQuat(self.render)
+        spawn_pos = self.camera.getPos(self.render) + q.getForward() * 2.0
+        self.particles.explode(spawn_pos)
+
+    def respawn(self):
+        if self.just_respawned: return
+        print(f"Respawning at {self.checkpoint}...")
+        self.checkpoint_pitch = 1.0
+        if self.respawn_sfx and hasattr(builtins.base, 'sound_enabled') and builtins.base.sound_enabled:
+            self.respawn_sfx.setTime(0.5)
+            self.respawn_sfx.play()
+        ac = self.world_manager.active_checkpoint_cube
+        if ac is not None and not ac.isEmpty() and not ac.getParent().isEmpty():
+            self.checkpoint = ac.getPos(self.render) + VBase3(0, 0, 1)
+        self.player.setPos(self.checkpoint)
+        self.player.setHpr(0, 0, 0)
+        self.camera.setP(0)
+        self.vz = 0; self.ground = False; self.just_respawned = True; self.start_cyan_effect()
+        
+        if hasattr(builtins, 'base'):
+            win = builtins.base.win
+            cx, cy = win.getXSize() // 2, win.getYSize() // 2
+            win.movePointer(0, cx, cy)
+
+    def activate_checkpoint(self, cube):
+        if self.checkpoint_sfx and hasattr(builtins.base, 'sound_enabled') and builtins.base.sound_enabled:
+            self.checkpoint_sfx.setPlayRate(self.checkpoint_pitch)
+            self.checkpoint_sfx.setTime(0.3)
+            self.checkpoint_sfx.play()
+            self.checkpoint_pitch += 0.1
+
+        old_active = self.world_manager.active_checkpoint_cube
+        self.world_manager.active_checkpoint_cube = cube
+        self.checkpoint = cube.getPos() + VBase3(0, 0, 1)
+        
+        if hasattr(builtins.base, 'particles_enabled') and builtins.base.particles_enabled:
+            self.particles.activate_checkpoint(cube.getPos())
+        
+        # Refresh materials of both old and new (chunk rebuild for static blocks, face restyle for movers)
+        if old_active and not old_active.isEmpty():
+            self.world_manager.update_cube_faces(old_active)
+        self.world_manager.update_cube_faces(cube)
+        
+        self.world_manager.map_is_dirty = True; self.world_manager.save_map()
+
+    def get_contacts(self, p_pos, h, ignore=()):
+        """Side-effect-free overlap query. Returns (out_of_bounds_or_floor, [overlapping cubes])."""
+        if not (-10000 < p_pos.x < 10000) or not (-10000 < p_pos.y < 10000) or not (-1000 < p_pos.z < 1000): return True, []
+        min_x = p_pos.x - self.w/2; max_x = p_pos.x + self.w/2
+        min_y = p_pos.y - self.w/2; max_y = p_pos.y + self.w/2
+        min_z = p_pos.z; max_z = p_pos.z + h
+        overlaps = lambda cp: (min_x < cp.x+0.5 and max_x > cp.x-0.5 and min_y < cp.y+0.5 and max_y > cp.y-0.5 and min_z < cp.z+0.5 and max_z > cp.z-0.5)
+        hits = []
+
+        for mc in self.world_manager.moving_cubes:
+            c = mc['np']
+            if c not in ignore and overlaps(c.getPos(self.render)): hits.append(c)
+
+        floor = False
+        wm = self.world_manager
+        if wm.god_collision_floor in wm.cubes:
+             gp = wm.god_collision_floor.getPos(self.render); fh = wm.FLOOR_HALF
+             if (min_x < gp.x+fh and max_x > gp.x-fh and min_y < gp.y+fh and max_y > gp.y-fh and min_z < gp.z+0.5 and max_z > gp.z-0.5): floor = True
+
+        try:
+            sx, ex = int(round(min_x)), int(round(max_x))
+            sy, ey = int(round(min_y)), int(round(max_y))
+            sz, ez = int(round(min_z+0.5)), int(round(max_z+0.5))
+        except: return True, hits
+
+        for x in range(sx-1, ex+2):
+            for y in range(sy-1, ey+2):
+                for z in range(sz-1, ez+2):
+                    if (c := wm.cube_map.get((x, y, z))) and c not in ignore and overlaps(c.getPos(self.render)): hits.append(c)
+        return floor, hits
+
+    def handle_contacts(self, hits):
+        """Apply contact events with fixed precedence: lethal first, then the nearest checkpoint."""
+        if self.god_mode or not hits: return
+        if any(c.getTag("material") == "3" for c in hits): self.respawn(); return
+        cps = [c for c in hits if c.getTag("material") == "4" and c != self.world_manager.active_checkpoint_cube]
+        if cps:
+            pp = self.player.getPos(self.render)
+            self.activate_checkpoint(min(cps, key=lambda c: (c.getPos(self.render) - pp).lengthSquared()))
+
+    def check_collision(self, p_pos, h, trigger_events=True, ignore=()):
+        floor, hits = self.get_contacts(p_pos, h, ignore)
+        if trigger_events: self.handle_contacts(hits)
+        return floor or bool(hits)
+
+    def carry(self, move, ignore=()):
+        """Move the player with a platform, using the same collision and contact rules as voluntary movement."""
+        steps = max(1, math.ceil(move.length() / self.max_step))
+        step = move / steps
+        for _ in range(steps):
+            for axis in (2, 0, 1):
+                d = VBase3(0, 0, 0); d[axis] = step[axis]
+                if d[axis] == 0: continue
+                np_ = self.player.getPos() + d
+                if self.check_collision(np_, self.player_height, ignore=ignore):
+                    if self.just_respawned: return
+                    # Pushed up into a ceiling: crushed. Blocked sideways or downward: the platform slides on without the player.
+                    if axis == 2 and d.z > 0 and not self.god_mode: self.respawn(); return
+                    continue
+                self.player.setPos(np_)
+                if self.just_respawned: return
+
+    def vertical_step(self, dz, keys):
+        """Move by one vertical sub-step. Returns True when the fall/rise was stopped."""
+        pp = self.player.getPos() + VBase3(0, 0, dz)
+        if not self.check_collision(pp, self.player_height):
+            self.player.setPos(pp); self.ground = False
+            return False
+        if self.just_respawned: return True
+        if self.vz > 0: self.vz = 0; return True
+
+        hgz = -float('inf'); g_cube = None
+        check_area = lambda cx, cy, cz, mx, my, mz, hw=0.5: (mx - self.w/2 < cx+hw and mx + self.w/2 > cx-hw and my - self.w/2 < cy+hw and my + self.w/2 > cy-hw and mz < cz+0.5 and mz + self.player_height > cz-0.5)
+
+        def check_obj(c):
+            nonlocal hgz, g_cube
+            cp = c.getPos(self.render)
+            if (cp.x - pp.x)**2 + (cp.y - pp.y)**2 + (cp.z - pp.z)**2 > 9.0: return
+            if check_area(cp.x, cp.y, cp.z, pp.x, pp.y, pp.z) and cp.z+0.5 > hgz: hgz = cp.z+0.5; g_cube = c
+
+        for mc in self.world_manager.moving_cubes: check_obj(mc['np'])
+        gf = self.world_manager.god_collision_floor
+        if gf in self.world_manager.cubes:
+            cp = gf.getPos(self.render)
+            if check_area(cp.x, cp.y, cp.z, pp.x, pp.y, pp.z, self.world_manager.FLOOR_HALF) and cp.z+0.5 > hgz: hgz = cp.z+0.5; g_cube = None
+
+        try:
+            sx, ex = int(round(pp.x - self.w/2)), int(round(pp.x + self.w/2))
+            sy, ey = int(round(pp.y - self.w/2)), int(round(pp.y + self.w/2))
+            sz = int(round(pp.z + 0.5))
+            for x in range(sx-1, ex+2):
+                for y in range(sy-1, ey+2):
+                    for z_chk in range(sz-2, sz+2):
+                        if c := self.world_manager.cube_map.get((x, y, z_chk)): check_obj(c)
+        except: pass
+
+        if g_cube is not None and g_cube.getTag("material") == "5" and self.vz < -4.0 and keys["space"]:
+            b = self.tag_num(g_cube, "bounciness", 1.3, 0.1); mh = self.tag_num(g_cube, "max_height", 0.0, 0.0)
+            nv = abs(self.vz) * b; cap = math.sqrt(2 * abs(self.g) * mh) if mh > 0 else 11.0
+            self.vz = min(nv, cap) if mh > 0 else nv
+            self.player.setZ(hgz + 0.01); self.ground = False
+            return True
+        if hgz > -10000:
+            self.player.setZ(hgz); self.vz = 0; self.ground = True
+            return True
+        self.player.setPos(pp); self.ground = False
+        return False
+
+    @staticmethod
+    def tag_num(c, tag, default, lo):
+        try: v = float(c.getTag(tag) or default)
+        except ValueError: return default
+        return v if math.isfinite(v) and v >= lo else default
+
+    def update(self, dt, keys):
+        self.particles.update(dt)
+        if self.just_respawned: self.just_respawned = False; return
+        dt = min(dt, 0.1)
+
+        if self.flying:
+            v = VBase3(0,0,0); q = self.camera.getQuat(self.render); f = q.getForward(); f.setZ(0); f.normalize(); r = q.getRight(); r.setZ(0); r.normalize()
+            if keys["w"]: v += f
+            if keys["s"]: v -= f
+            if keys["a"]: v -= r
+            if keys["d"]: v += r
+            if keys["space"]: v.z += 1
+            if keys["lcontrol"]: v.z -= 1
+            if v.lengthSquared() > 0: self.player.setPos(self.player.getPos() + v.normalized() * self.fly_speed * dt)
+        else:
+            wants_crouch = keys["lcontrol"]
+            if not wants_crouch:
+                if self.check_collision(self.player.getPos(), self.h_stand, trigger_events=False):
+                    wants_crouch = True
+
+            th = self.h_crouch if wants_crouch else self.h_stand
+            t_head = self.head_crouch if wants_crouch else self.head_stand
+            
+            self.curr_h += (th - self.curr_h) * dt * 7.0
+            self.head.setZ(self.head.getZ() + (t_head - self.head.getZ()) * dt * 7.0)
+            self.player_height = self.curr_h
+
+            if keys["space"] and self.ground: self.vz = self.jump; self.ground = False
+            self.vz += self.g * dt
+            dz = self.vz * dt; steps = max(1, math.ceil(abs(dz) / self.max_step))
+            for _ in range(steps):
+                if self.vertical_step(dz / steps, keys): break
+            if self.just_respawned: return
+
+            sp = 2.0 if keys["lcontrol"] else 5.0
+            mv = VBase3(0,0,0)
+            if keys["w"]: mv.y += 1
+            if keys["s"]: mv.y -= 1
+            if keys["a"]: mv.x -= 1
+            if keys["d"]: mv.x += 1
+            if mv.lengthSquared() > 0:
+                ov = self.player.getQuat().xform(mv.normalized()) * sp * dt
+                
+                next_x = self.player.getPos() + VBase3(ov.x, 0, 0)
+                if not self.check_collision(next_x, self.player_height): 
+                    can_move = True
+                    if keys["lcontrol"] and self.ground:
+                        if not self.check_collision(next_x - VBase3(0, 0, 0.1), self.player_height, trigger_events=False):
+                            can_move = False
+                    if can_move:
+                        if not self.just_respawned: self.player.setX(self.player.getX() + ov.x)
+
+                next_y = self.player.getPos() + VBase3(0, ov.y, 0)
+                if not self.check_collision(next_y, self.player_height): 
+                    can_move = True
+                    if keys["lcontrol"] and self.ground:
+                        if not self.check_collision(next_y - VBase3(0, 0, 0.1), self.player_height, trigger_events=False):
+                            can_move = False
+                    if can_move:
+                        if not self.just_respawned: self.player.setY(self.player.getY() + ov.y)

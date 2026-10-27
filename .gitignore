@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Personal map and settings
+/map_save.txt
+/Settings.json
+/data/
+
+# Runtime leftovers from map saving/loading
+*.tmp
+*.bak
+
+# Local notes and tools
+AIPrompt.txt
+FolderView*
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
