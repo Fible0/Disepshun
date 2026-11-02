@@ -112,7 +112,7 @@ class WorldManager:
             color = ((1,0,0,1) if c.getTag('material')=='3' else
                      (0,.6,.8,1) if c==self.active_checkpoint_cube else (0,1,0,1))
             if c.hasPythonTag('selection_color'): color=c.getPythonTag('selection_color')
-            strength=2.6 if c.getTag('material')=='3' else 1.6
+            strength=2.0 if c.getTag('material')=='3' else 1.6
             light.setColor(tuple(v*strength for v in color[:3])+(1,))
             node.setPos(c.getPos(self.render))
 

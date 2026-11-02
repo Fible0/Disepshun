@@ -317,7 +317,7 @@ class Disepshun(EditorTools, ShowBase):
         self.set_glow_enabled(v)
 
     def set_glow_enabled(self, enabled):
-        from direct.filter.CommonFilters import CommonFilters
+        from disepshun.bloom import NeonBloom
         filters = getattr(self, 'glow_filters', None)
         if not enabled:
             if filters is not None: filters.cleanup()
@@ -326,43 +326,9 @@ class Disepshun(EditorTools, ShowBase):
         if filters is not None: return
         # Windowless verification has no post-processing target.
         if not hasattr(self.win, 'getGsg') or self.win.getGsg() is None: return
-        filters = CommonFilters(self.win, self.cam)
-        if filters.setBloom(blend=(0,0,0,1), mintrigger=.05, maxtrigger=.6,
-                            desat=0, intensity=3.0, size='large'):
+        filters = NeonBloom(self.win, self.cam)
+        if filters.ok:
             self.glow_filters = filters
-            # Keep strong, broad halos from washing the glowing faces into pastels.
-            vertex = """#version 120
-uniform mat4 p3d_ModelViewProjectionMatrix;
-attribute vec4 p3d_Vertex;
-varying vec2 uv;
-void main() {
-    gl_Position=p3d_ModelViewProjectionMatrix*p3d_Vertex;
-    uv=p3d_Vertex.xz*.5+.5;
-}
-"""
-            fragment = """#version 120
-uniform sampler2D scene;
-uniform sampler2D halo;
-uniform vec2 scene_scale;
-uniform vec2 halo_scale;
-varying vec2 uv;
-void main() {
-    vec4 base=texture2D(scene,uv*scene_scale);
-    float core=smoothstep(.55,.85,base.a);
-    vec3 surface=clamp(base.rgb*mix(1.0,1.15,core),0.0,1.0);
-    vec3 glow=clamp(texture2D(halo,uv*halo_scale).rgb*.5,0.0,1.0);
-    float pureRed=step(max(glow.g,glow.b)*3.0+.005,glow.r);
-    glow.r=min(1.0,glow.r*mix(1.0,2.0,pureRed));
-    vec3 combined=1.0-(1.0-glow)*(1.0-surface);
-    gl_FragColor=vec4(mix(combined,surface,core),1.0);
-}
-"""
-            filters.finalQuad.setShader(Shader.make(Shader.SL_GLSL,vertex=vertex,fragment=fragment))
-            filters.finalQuad.setShaderInput('scene',filters.textures['color'])
-            filters.finalQuad.setShaderInput('halo',filters.textures['bloom3'])
-            for name,key in (('scene','color'),('halo','bloom3')):
-                scale=filters.textures[key].getTexScale()
-                filters.finalQuad.setShaderInput(name+'_scale',Vec2(scale.x,scale.y))
         else:
             filters.cleanup()
             self.glow_filters = None
@@ -596,10 +562,7 @@ void main() {
 
     def update(self, task):
         filters=getattr(self,'glow_filters',None)
-        if filters is not None:
-            for name,key in (('scene','color'),('halo','bloom3')):
-                scale=filters.textures[key].getTexScale()
-                filters.finalQuad.setShaderInput(name+'_scale',Vec2(scale.x,scale.y))
+        if filters is not None: filters.update()
         self.presence.tick('In settings' if self.menu_open else self.TOOL_NAMES.get(self.tool_mode, 'Building' if self.build_material else 'Exploring'), len(self.world.cubes)+len(self.world.moving_cubes)-int(self.physics.god_mode and not self.world.visual_floor.isHidden()))
         foc = (self.win.getWindowHandle().getIntHandle() == user32.GetForegroundWindow()) if user32 else self.win.getProperties().getForeground()
         if foc != self.is_focused:
