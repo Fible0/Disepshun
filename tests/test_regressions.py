@@ -1213,6 +1213,26 @@ def gpu_startup_and_escape(tmp):
     a.toggle_menu();assert not a.gpu_notice_open and not a.menu_open
     a.gpu_notice_open=True;a.paused=False;assert a.input_blocked()
 
+@proof('E51 a missing save starts from the bundled DMF default map, unchanged and without a backup')
+def default_map(tmp):
+    w=world(tmp); w.save_file=str(Path(tmp)/'data'/'map_save.dmf'); w.default_map_file=str(ROOT/'assets'/'default_map.dmf')
+    with immediate(): w.load_map()
+    assert Path(w.save_file).read_bytes()==Path(w.default_map_file).read_bytes()
+    assert len(live(w))==9 and not w.load_errors and not w.save_blocked and not w.map_is_dirty
+    assert w.cube_map[w.get_grid_key(V(0,0,0.5))].getTag('material')=='4'
+    assert not list(Path(tmp).rglob('*.bak'))
+    w2=world(tmp); w2.save_file=str(Path(tmp)/'empty'/'map_save.dmf'); w2.default_map_file=str(Path(tmp)/'missing.dmf')
+    w2.load_map(); assert not live(w2) and not w2.save_blocked
+
+@proof('E52 closing Settings discards the stale menu cursor position instead of turning the camera with it')
+def menu_close_mouse(tmp):
+    a=app(world(tmp)); warps=[]; a.ignore_mouse_input=False; a.play_sfx=lambda *x:None
+    a.ui=NS(set_menu_visible=lambda v:None)
+    a.win=NS(getXSize=lambda:100,getYSize=lambda:100,movePointer=lambda *p:warps.append(p),requestProperties=lambda wp:None)
+    a.toggle_menu(); assert a.menu_open
+    a.ignore_mouse_input=False
+    a.toggle_menu(); assert not a.menu_open and warps[-1]==(0,50,50) and a.ignore_mouse_input
+
 if __name__=='__main__':
     failures=[]
     print('Source classes only; no Config execution, ShowBase, graphics pipe, window, or game loop.')

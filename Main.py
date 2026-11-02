@@ -153,6 +153,11 @@ class Disepshun(EditorTools, ShowBase):
     def center_mouse(self):
         cx, cy = self.win.getXSize() // 2, self.win.getYSize() // 2
         self.win.movePointer(0, cx, cy)
+        # The warp can be dropped (e.g. XWayland ignores it while the cursor is still visible,
+        # and the hide request only applies next frame) while Panda caches the pointer as
+        # centred. The next real motion then reports the old menu position, so discard the
+        # first off-centre reading and re-centre instead of turning the camera with it.
+        self.ignore_mouse_input = True
 
     CUBE_FACES = [((0, -0.5, 0), 180, 0), ((0, 0.5, 0), 0, 0), ((-0.5, 0, 0), -90, 0), ((0.5, 0, 0), 90, 0), ((0, 0, 0.5), 0, -90), ((0, 0, -0.5), 0, 90)]
     GHOST_FIRST = (1, 0.7, 0.15); GHOST_MAX = (0.7, 0.35, 1) # Amber: first bounce, violet: highest bounce

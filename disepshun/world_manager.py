@@ -18,6 +18,7 @@ class WorldManager:
         self.cube_map = {} 
         self.moving_cubes = []
         self.save_file = os.path.join(DATA_DIR, "map_save.dmf")
+        self.default_map_file = os.path.join(ROOT_DIR, "assets", "default_map.dmf")
         self.map_is_dirty = False
         self.save_lock = threading.Lock()
         self.save_gen = 0; self.committed_gen = 0 # Snapshot order; older writers never replace newer files
@@ -623,24 +624,20 @@ class WorldManager:
         elif not os.path.exists(self.save_file) and os.path.exists(legacy):
             source = legacy
         else: source = self.save_file
+        fresh = None
         if not os.path.exists(source):
-            default_map = """0.0,0.0,0.5,4
--1.0,0.0,0.5,2
-0.0,-1.0,0.5,2
-1.0,0.0,0.5,2
-0.0,1.0,0.5,2
-1.0,1.0,0.5,1
-1.0,-1.0,0.5,1
--1.0,-1.0,0.5,1
--1.0,1.0,0.5,1
-"""
-            os.makedirs(os.path.dirname(self.save_file), exist_ok=True)
-            with open(source, "w") as f:
-                f.write(default_map)
+            # No save yet: start from the bundled default map
+            try:
+                os.makedirs(os.path.dirname(self.save_file), exist_ok=True)
+                shutil.copyfile(self.default_map_file, self.save_file)
+            except OSError as e:
+                print(f"Default map could not be copied ({e}); starting with an empty map")
+                fresh = ([self.MAP_HEADER], [])
+            source = self.save_file
 
         import zlib
         try:
-            lines, properties = self.read_map(source)
+            lines, properties = fresh or self.read_map(source)
         except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError, EOFError, zlib.error) as e:
             # Reject the whole load and never overwrite a file we could not read
             self.save_blocked = True
