@@ -17,7 +17,7 @@ class WorldManager:
         self.cubes = [] # Logical nodes (Collision only)
         self.cube_map = {} 
         self.moving_cubes = []
-        self.save_file = os.path.join(DATA_DIR, "map_save.txt")
+        self.save_file = os.path.join(DATA_DIR, "map_save.dmf")
         self.map_is_dirty = False
         self.save_lock = threading.Lock()
         self.save_gen = 0; self.committed_gen = 0 # Snapshot order; older writers never replace newer files
@@ -25,6 +25,7 @@ class WorldManager:
         self.save_error = None
         self.save_blocked = False # Set when the map file could not be read, so it is never overwritten
         self.next_save_retry = 0.0
+        self.pending_save_at = None
         self.load_errors = []
         self.active_checkpoint_cube = None
         self.saved_checkpoint_pos = None
@@ -32,7 +33,9 @@ class WorldManager:
         self.cube_pool = []
         
         self.chunk_size = 16
-        self.chunks_visual = {} 
+        self.chunks_visual = {}
+        self.collision_chunks = {}
+        self.chunk_format = GeomVertexFormat.getV3n3t2()
         self.chunk_contents = defaultdict(list) 
         self.dirty_chunks = set()
         
@@ -45,16 +48,20 @@ class WorldManager:
         # Optimization: Backface Culling (Hides inside of blocks)
         self.face_node.setTwoSided(False)
         
-        # --- Neon Materials ---
-        self.red_glow_mat = Material()
-        self.red_glow_mat.setEmission(VBase4(1, 0, 0, 1))
-        
-        self.lime_glow_mat = Material()
-        self.lime_glow_mat.setEmission(VBase4(0, 1, 0, 1))
-        
-        self.cyan_glow_mat = Material()
-        self.cyan_glow_mat.setEmission(VBase4(0, 0.6, 0.8, 1)) 
-        
+        # Emission keeps the neon visible; diffuse lighting gives each face depth.
+        self.red_glow_mat = self.make_glow_material((1,0,0,1))
+        self.lime_glow_mat = self.make_glow_material((0,1,0,1))
+        self.cyan_glow_mat = self.make_glow_material((0,.6,.8,1))
+        self.selection_glow_mats = {}
+        self.glow_stage = TextureStage('neon_glow')
+        self.glow_stage.setMode(TextureStage.MGlow)
+        mask = PNMImage(1,1,4)
+        mask.fill(0,0,0); mask.alphaFill(1.0)
+        self.glow_texture = Texture('neon_glow_mask')
+        self.glow_texture.load(mask)
+
+        self.glow_lights = []; self.glow_sources = []; self.next_glow_scan = 0.0
+        self.shaders_enabled = True
         self.setup_lights()
         self.create_sky()
         self.create_boundary_objects()
@@ -78,13 +85,44 @@ class WorldManager:
         self.dlnp.setHpr(45, -60, 0)
         self.render.setLight(self.dlnp)
         self.render.setShaderAuto()
+        # A fixed small pool avoids adding a light (and a shader cost) per block.
+        for i in range(4):
+            light=PointLight(f'neon_spill_{i}')
+            light.setColor((0,0,0,1)); light.setAttenuation((1,0,1.8))
+            node=self.render.attachNewNode(light); self.render.setLight(node)
+            self.glow_lights.append((light,node))
+
+    def update_glow_lights(self, camera_pos, now=None):
+        if not self.shaders_enabled: return
+        now = time.monotonic() if now is None else now
+        if now >= self.next_glow_scan:
+            self.next_glow_scan = now+.2
+            nearby=[]
+            for c in self.all_blocks():
+                if c.getTag('material') not in ('3','4'): continue
+                d=(c.getPos(self.render)-camera_pos).lengthSquared()
+                if d < 225: nearby.append((d,c))
+            nearby.sort(key=lambda item:item[0])
+            self.glow_sources=[c for _,c in nearby[:len(self.glow_lights)]]
+        for i,(light,node) in enumerate(self.glow_lights):
+            c=self.glow_sources[i] if i<len(self.glow_sources) else None
+            if c is None or c.isEmpty() or c.getParent().isEmpty() or c.getTag('material') not in ('3','4'):
+                light.setColor((0,0,0,1)); continue
+            color = ((1,0,0,1) if c.getTag('material')=='3' else
+                     (0,.6,.8,1) if c==self.active_checkpoint_cube else (0,1,0,1))
+            if c.hasPythonTag('selection_color'): color=c.getPythonTag('selection_color')
+            strength=2.6 if c.getTag('material')=='3' else 1.6
+            light.setColor(tuple(v*strength for v in color[:3])+(1,))
+            node.setPos(c.getPos(self.render))
 
     def set_shaders_enabled(self, v):
+        self.shaders_enabled = bool(v)
         if v:
             self.render.clearLight() 
             self.render.setLightOff(0) 
             self.render.setLight(self.alnp)
             self.render.setLight(self.dlnp)
+            for _,node in self.glow_lights: self.render.setLight(node)
             self.render.setShaderAuto()
         else:
             self.render.clearLight()
@@ -125,85 +163,67 @@ class WorldManager:
         if ly == 0: self.dirty_chunks.add((key[0], key[1]-1))
         if ly == self.chunk_size - 1: self.dirty_chunks.add((key[0], key[1]+1))
 
-    def update_chunks(self):
+    def update_chunks(self, budget_seconds=None):
         if not self.dirty_chunks: return
-        for key in self.dirty_chunks:
+        started=time.perf_counter()
+        for key in list(self.dirty_chunks):
             self.rebuild_chunk(key)
-        self.dirty_chunks.clear()
+            self.dirty_chunks.discard(key)
+            if budget_seconds is not None and time.perf_counter()-started >= budget_seconds: break
+
+    # Counter-clockwise vertices viewed from outside, with matching outward normals.
+    FACE_DATA = (
+        ((0,-1,0), ((-.5,-.5,-.5),(.5,-.5,-.5),(.5,-.5,.5),(-.5,-.5,.5))),
+        ((0,1,0), ((.5,.5,-.5),(-.5,.5,-.5),(-.5,.5,.5),(.5,.5,.5))),
+        ((-1,0,0), ((-.5,.5,-.5),(-.5,-.5,-.5),(-.5,-.5,.5),(-.5,.5,.5))),
+        ((1,0,0), ((.5,-.5,-.5),(.5,.5,-.5),(.5,.5,.5),(.5,-.5,.5))),
+        ((0,0,1), ((-.5,-.5,.5),(.5,-.5,.5),(.5,.5,.5),(-.5,.5,.5))),
+        ((0,0,-1), ((-.5,.5,-.5),(.5,.5,-.5),(.5,-.5,-.5),(-.5,-.5,-.5))),
+    )
 
     def rebuild_chunk(self, key):
-        if key in self.chunks_visual:
-            self.chunks_visual[key].removeNode()
-            del self.chunks_visual[key]
-
-        temp_node = NodePath(f"chunk_{key}")
-        has_geom = False
-
-        cubes_in_chunk = self.chunk_contents.get(key, [])
-        
-        for c in cubes_in_chunk:
+        from array import array
+        batches={}
+        for c in self.chunk_contents.get(key, ()):
             if c.isHidden(): continue
-            
-            pos = c.getPos()
-            grid_key = self.get_grid_key(pos)
-            x, y, z = grid_key
-            mat = c.getTag("material")
-            
-            visible_faces = 0
-            
-            face_defs = [
-                # Front (Y-): needs normal (0,-1,0). Card is (0,-1,0). Rotation: 0
-                ((0, -0.5, 0), 0, 0, (x, y - 1, z)),
-                # Back (Y+): needs normal (0,1,0). Card is (0,-1,0). Rotation: 180
-                ((0, 0.5, 0), 180, 0, (x, y + 1, z)),
-                # Left (X-): needs normal (-1,0,0). Card (0,-1,0). Rot -90 -> (-1,0,0)
-                ((-0.5, 0, 0), -90, 0, (x - 1, y, z)),
-                # Right (X+): needs normal (1,0,0). Card (0,-1,0). Rot 90 -> (1,0,0)
-                ((0.5, 0, 0), 90, 0, (x + 1, y, z)),
-                # Top (Z+): needs normal (0,0,1). Card (0,-1,0). Pitch -90 -> (0,0,1)
-                ((0, 0, 0.5), 0, -90, (x, y, z + 1)),
-                # Bottom (Z-): needs normal (0,0,-1). Card (0,-1,0). Pitch 90 -> (0,0,-1)
-                ((0, 0, -0.5), 0, 90, (x, y, z - 1))
-            ]
-
-            for f_pos, f_h, f_p, n_key in face_defs:
-                neighbor = self.cube_map.get(n_key)
-                show_face = True
-                
-                if neighbor:
-                    if not any(mc['np'] == neighbor for mc in self.moving_cubes):
-                        if not neighbor.isHidden():
-                            show_face = False
-                
-                if show_face:
-                    f = self.face_node.copyTo(temp_node)
-                    f.setPos(pos + VBase3(f_pos))
-                    f.setHpr(f_h, f_p, 0)
-                    
-                    if mat in ("3", "4"): self.style_face(f, c)
-                    else: f.setColor(c.getColor())
-                        
-                    f.setTwoSided(False)
-                    has_geom = True
-                    visible_faces += 1
-            
-            # Optimization: Stash fully occluded blocks
-            if visible_faces == 0:
-                if not c.isStashed():
-                    c.stash()
-            else:
-                if c.isStashed():
-                    c.unstash()
-
-        if has_geom:
-            temp_node.flattenStrong()
-            temp_node.reparentTo(self.platform_holder)
-            self.chunks_visual[key] = temp_node
+            pos=c.getPos(); x,y,z=self.get_grid_key(pos)
+            color=tuple(c.getColor()); scale=tuple(c.getColorScale())
+            tint=c.getPythonTag('selection_color') if c.hasPythonTag('selection_color') else None
+            appearance=(c.getTag('material'),color,scale,c==self.active_checkpoint_cube,tint)
+            visible=0
+            for normal,corners in self.FACE_DATA:
+                nx,ny,nz=normal
+                neighbor=self.cube_map.get((x+nx,y+ny,z+nz))
+                if neighbor is not None and not neighbor.isHidden(): continue
+                if appearance not in batches: batches[appearance]=(array('f'),array('I'),c)
+                vertices,indices,_=batches[appearance]; first=len(vertices)//8
+                for (dx,dy,dz),(u,v) in zip(corners,((0,0),(1,0),(1,1),(0,1))):
+                    vertices.extend((pos.x+dx,pos.y+dy,pos.z+dz,nx,ny,nz,u,v))
+                indices.extend((first,first+1,first+2,first,first+2,first+3)); visible+=1
+            if visible==0:
+                if not c.isStashed(): c.stash()
+            elif c.isStashed(): c.unstash()
+        node=GeomNode(f'chunk_{key}'); node.setIntoCollideMask(BitMask32.allOff())
+        for vertices,indices,c in batches.values():
+            data=GeomVertexData('chunk_faces',self.chunk_format,Geom.UHStatic)
+            data.modifyArray(0).modifyHandle().setData(vertices.tobytes())
+            triangles=GeomTriangles(Geom.UHStatic); triangles.setIndexType(Geom.NTUint32)
+            triangles.modifyVertices().modifyHandle().setData(indices.tobytes())
+            geom=Geom(data); geom.addPrimitive(triangles)
+            style=NodePath('chunk_style'); self.style_face(style,c); style.setColorScale(c.getColorScale())
+            node.addGeom(geom,style.getState())
+        old=self.chunks_visual.pop(key,None)
+        if old is not None: old.removeNode()
+        if batches: self.chunks_visual[key]=self.platform_holder.attachNewNode(node)
 
     def register_cube(self, cube):
-        k = self.get_chunk_key(cube.getPos())
-        self.chunk_contents[k].append(cube)
-        
+        key=self.get_chunk_key(cube.getPos())
+        self.chunk_contents[key].append(cube)
+        # Spatial bounds let the picking ray skip whole regions of colliders.
+        if key not in self.collision_chunks:
+            self.collision_chunks[key]=self.platform_holder.attachNewNode(f'chunk_colliders_{key}')
+        cube.reparentTo(self.collision_chunks[key])
+
     def unregister_cube(self, cube):
         k = self.get_chunk_key(cube.getPos())
         if cube in self.chunk_contents[k]:
@@ -220,6 +240,10 @@ class WorldManager:
                 cube.clearColor()
                 cube.clearColorScale()
                 cube.setPos(0,0,0)
+                cube.clearPythonTag("selection_color")
+                cube.clearPythonTag("history_id")
+                cube.clearTag("group")
+                cube.clearTag("heading")
                 cube.setTag("material", "")
                 cube.setTag("bounciness", "")
                 cube.setTag("max_height", "")
@@ -250,18 +274,38 @@ class WorldManager:
     def get_grid_key(self, pos):
         return (math.floor(pos.x + 0.5), math.floor(pos.y + 0.5), math.floor(pos.z + 0.5))
 
+    @staticmethod
+    def make_glow_material(color):
+        material = Material()
+        material.setEmission(VBase4(*(v*.45 for v in color[:3]), 1))
+        material.setDiffuse(VBase4(*(v*.55 for v in color[:3]), 1))
+        material.setAmbient(VBase4(*(v*.55 for v in color[:3]), 1))
+        material.setSpecular(VBase4(.08,.08,.08,1))
+        material.setShininess(20)
+        return material
+
     def style_face(self, f, cube):
-        mat = cube.getTag("material")
-        if mat == "3":
-            f.setMaterial(self.red_glow_mat)
-            f.setColor(1, 0, 0, 1)
-        elif mat == "4":
-            if cube == self.active_checkpoint_cube:
-                f.setMaterial(self.cyan_glow_mat)
-                f.setColor(0, 0.6, 0.8, 1)
-            else:
-                f.setMaterial(self.lime_glow_mat)
-                f.setColor(0, 1, 0, 1)
+        mat = cube.getTag('material')
+        color = tuple(cube.getColor())
+        material = None
+        if mat == '3': color = (1,0,0,1); material = self.red_glow_mat
+        elif mat == '4':
+            active = cube == self.active_checkpoint_cube
+            color = (0,.6,.8,1) if active else (0,1,0,1)
+            material = self.cyan_glow_mat if active else self.lime_glow_mat
+        if cube.hasPythonTag('selection_color'):
+            color = cube.getPythonTag('selection_color')
+            if material is not None:
+                key=(mat,color)
+                if key not in self.selection_glow_mats:
+                    self.selection_glow_mats[key] = self.make_glow_material(color)
+                material = self.selection_glow_mats[key]
+        f.clearMaterial()
+        f.clearTexture(self.glow_stage)
+        if material is not None:
+            f.setMaterial(material)
+            f.setTexture(self.glow_stage, self.glow_texture)
+        f.setColor(*color)
 
     def find_mover(self, np):
         for mc in self.moving_cubes:
@@ -320,6 +364,7 @@ class WorldManager:
         self.platform_holder = self.render.attachNewNode("PlatformHolder")
         self.chunk_contents.clear()
         self.chunks_visual.clear()
+        self.collision_chunks.clear()
         
         self.cubes = []; self.cube_map = {}; self.moving_cubes = []
         
@@ -330,8 +375,11 @@ class WorldManager:
             if gen <= self.committed_gen: return # A newer snapshot is already on disk
             tmp = self.save_file + ".tmp"
             try:
+                if isinstance(data,tuple):
+                    import gzip
+                    data=b'DMAP3\n'+gzip.compress(data[0],mtime=0)
                 # Write a temp file and swap it in, so a failed write never truncates the last good map
-                with open(tmp, "w") as f:
+                with open(tmp, "wb") as f:
                     f.write(data); f.flush(); os.fsync(f.fileno())
                 os.replace(tmp, self.save_file)
             except Exception as e:
@@ -345,7 +393,7 @@ class WorldManager:
             self.committed_gen = gen
             if gen == self.save_gen: self.save_error = None
 
-    def serialize_map(self):
+    def serialize_records(self):
         buf = [self.MAP_HEADER + "\n"]
         movers = [m for m in self.moving_cubes if not m['np'].isEmpty()]
         ac = self.active_checkpoint_cube
@@ -354,8 +402,9 @@ class WorldManager:
             if mi is not None: buf.append(f"CP,M,{mi}\n")
             elif ac in self.cubes:
                 p = ac.getPos(); buf.append(f"CP,S,{p.x},{p.y},{p.z}\n")
+        mover_nodes = {m['np'] for m in movers}
         for c in self.cubes:
-            if c == self.god_collision_floor or self.find_mover(c): continue
+            if c == self.god_collision_floor or c in mover_nodes: continue
             p = c.getPos(); m = c.getTag("material")
             if m:
                 l = f"B,{p.x},{p.y},{p.z},{m}"
@@ -368,11 +417,90 @@ class WorldManager:
             buf.append(l + "\n")
         return "".join(buf)
 
+    def all_blocks(self):
+        return [c for c in self.cubes if c != self.god_collision_floor] + [m['np'] for m in self.moving_cubes]
+
+    def serialize_map(self, compress=True):
+        """Capture scene values now; save writers can compress the immutable byte snapshot."""
+        import gzip, json
+        nodes = self.all_blocks()
+        payload = {"version": 3, "records": self.serialize_records(),
+                   "properties": [[c.getTag("group"), float(c.getTag("heading") or 0)] for c in nodes]}
+        raw=json.dumps(payload,separators=(',',':')).encode('utf8')
+        return b'DMAP3\n'+gzip.compress(raw,mtime=0) if compress else (raw,)
+
+    def read_map(self, path):
+        import gzip, json, io
+        with open(path, "rb") as f: data = f.read()
+        props = None
+        if data.startswith(b"DMAP3\n"):
+            with gzip.GzipFile(fileobj=io.BytesIO(data[6:])) as f:
+                raw = f.read(64 * 1024 * 1024 + 1)
+            if len(raw) > 64 * 1024 * 1024: raise ValueError("map exceeds 64 MiB")
+            obj = json.loads(raw)
+            if not isinstance(obj, dict): raise ValueError('invalid map container')
+            if obj.get('version') != 3: raise ValueError("unsupported map version")
+            if not isinstance(obj['records'], str): raise ValueError('invalid map records')
+            lines = obj['records'].splitlines()
+            props = obj['properties']
+            if not isinstance(props, list): raise ValueError("invalid map properties")
+            for group, heading in props:
+                if not isinstance(group, str) or len(group) > 128: raise ValueError("invalid group")
+                self._num(heading, -360, 360)
+        else: lines = data.decode('utf-8-sig').splitlines()
+        return lines, props
+
+    def convert_maps(self, directory):
+        """Convert valid legacy maps without replacing the originals."""
+        import gzip, json
+        converted = 0
+        self.conversion_errors = []
+        import zlib
+        for name in sorted(os.listdir(directory), key=lambda name: not name.lower().endswith('.dmap')):
+            if not name.lower().endswith(('.txt', '.dmap')): continue
+            source = os.path.join(directory, name)
+            target = os.path.splitext(source)[0] + '.dmf'
+            if os.path.exists(target) or not os.path.isfile(source): continue
+            try:
+                lines, props = self.read_map(source)
+                blocks, movers, cp, errors = self.parse_map(lines)
+                if errors or (props is not None and len(props) != len(blocks)+len(movers)):
+                    raise ValueError('invalid records or properties')
+            except (OSError, ValueError, KeyError, TypeError, EOFError, zlib.error) as e:
+                self.conversion_errors.append(f'{name}: {e}')
+                continue
+            records = [self.MAP_HEADER]
+            if cp:
+                kind, value = cp
+                if kind == 'M': records.append(f'CP,M,{value}')
+                else:
+                    mi = next((i for i, r in enumerate(movers) if r['pos'] == value), None)
+                    if kind == 'P' and mi is not None: records.append(f'CP,M,{mi}')
+                    else: records.append('CP,S,' + ','.join(map(str, value)))
+            for r in blocks + movers:
+                moving = 'speed' in r
+                fields = ['M' if moving else 'B', *r['pos'], r['mat']]
+                if moving: fields += [r['speed'], r['bounce'], r['max_h'], *[v for w in r['waypoints'] for v in w]]
+                elif r['mat'] == 5: fields += [r['bounce'], r['max_h']]
+                records.append(','.join(map(str, fields)))
+            payload = dict(version=3, records='\n'.join(records)+'\n', properties=props or [['', 0] for _ in blocks+movers])
+            data = b'DMAP3\n' + gzip.compress(json.dumps(payload, separators=(',', ':')).encode('utf8'), mtime=0)
+            with open(target + '.tmp', 'wb') as f: f.write(data)
+            os.replace(target + '.tmp', target)
+            converted += 1
+        return converted
+
+    def queue_save(self):
+        """Coalesce rapid placements and checkpoint changes, without delaying exit saves."""
+        self.map_is_dirty = True
+        if self.pending_save_at is None: self.pending_save_at = time.monotonic()+.35
+
     def save_map(self):
         if not self.map_is_dirty: return
         if self.save_blocked: return # Map file was unreadable at load; keep it untouched and stay dirty
+        self.pending_save_at = None
         self.save_gen += 1
-        data = self.serialize_map()
+        data = self.serialize_map(compress=False)
         self.map_is_dirty = False
         self.save_threads = [t for t in self.save_threads if t.is_alive()]
         # Non-daemon so the interpreter waits for pending writes on exit
@@ -381,6 +509,11 @@ class WorldManager:
 
     def retry_save(self, now):
         """Called every frame; retries a failed save every couple of seconds."""
+        if self.pending_save_at is not None:
+            if time.monotonic() < self.pending_save_at: return
+            self.pending_save_at = None
+            self.save_map()
+            return
         if self.map_is_dirty and not self.save_blocked and now >= self.next_save_retry:
             self.next_save_retry = now + 2.0
             self.save_map()
@@ -482,8 +615,15 @@ class WorldManager:
         while os.path.exists(bak): n += 1; bak = f"{path}.{stamp}-{n}.bak"
         return bak
 
-    def load_map(self):
-        if not os.path.exists(self.save_file):
+    def load_map(self, migrate=True):
+        legacy = os.path.splitext(self.save_file)[0] + '.txt'
+        previous = os.path.splitext(self.save_file)[0] + '.dmap'
+        if not os.path.exists(self.save_file) and os.path.exists(previous):
+            source = previous
+        elif not os.path.exists(self.save_file) and os.path.exists(legacy):
+            source = legacy
+        else: source = self.save_file
+        if not os.path.exists(source):
             default_map = """0.0,0.0,0.5,4
 -1.0,0.0,0.5,2
 0.0,-1.0,0.5,2
@@ -495,12 +635,13 @@ class WorldManager:
 -1.0,1.0,0.5,1
 """
             os.makedirs(os.path.dirname(self.save_file), exist_ok=True)
-            with open(self.save_file, "w") as f:
+            with open(source, "w") as f:
                 f.write(default_map)
 
+        import zlib
         try:
-            with open(self.save_file, "r") as f: lines = f.readlines()
-        except (OSError, UnicodeDecodeError) as e:
+            lines, properties = self.read_map(source)
+        except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError, EOFError, zlib.error) as e:
             # Reject the whole load and never overwrite a file we could not read
             self.save_blocked = True
             self.save_error = f"Map file could not be read ({e}); saving is disabled so it is not overwritten."
@@ -508,12 +649,16 @@ class WorldManager:
             return
 
         blocks, movers, cp, errors = self.parse_map(lines)
+        if properties is not None and len(properties) != len(blocks) + len(movers):
+            self.save_blocked = True
+            self.save_error = "Map properties do not match its objects; saving disabled."
+            return
         self.load_errors = errors
         if errors:
             for e in errors: print("Map load:", e)
             # Keep the original so rejected records are not lost when the cleaned map is saved
-            bak = self.backup_name(self.save_file)
-            try: shutil.copy2(self.save_file, bak); print(f"Map load: original file kept as {bak}")
+            bak = self.backup_name(source)
+            try: shutil.copy2(source, bak); print(f"Map load: original file kept as {bak}")
             except OSError as e:
                 self.save_blocked = True
                 self.save_error = f"Map had invalid records and could not be backed up ({e}); saving is disabled."
@@ -521,6 +666,7 @@ class WorldManager:
 
         self.platform_holder.getChildren().detach()
         self.chunks_visual.clear()
+        self.collision_chunks.clear()
         self.chunk_contents.clear()
 
         for c in self.cubes:
@@ -540,6 +686,11 @@ class WorldManager:
             self.moving_cubes.append({'np': c, 'waypoints': rec['waypoints'], 'speed': rec['speed'], 'current_idx': 0, 'wait_timer': 0, 'origin': rec['pos'], 'direction': 1})
             self.update_cube_faces(c)
 
+        if properties is not None:
+            for c, (group, heading) in zip(self.all_blocks(), properties):
+                if group: c.setTag('group', group)
+                c.setTag('heading', str(heading))
+
         if cp:
             kind, val = cp; c = None
             if kind == 'M':
@@ -557,6 +708,14 @@ class WorldManager:
             else: print("Map load: saved checkpoint does not match a checkpoint block; ignored")
 
         self.update_chunks()
+        if migrate and (properties is None or source != self.save_file) and not errors and not self.save_blocked:
+            try:
+                shutil.copy2(source, self.backup_name(source))
+                self.map_is_dirty = True
+                self.save_map()
+            except OSError as e:
+                self.save_error = f"Map conversion backup failed: {e}"
+                self.save_blocked = True
 
     def update_god_collision(self, gm):
         if gm and not self.visual_floor.isHidden():

@@ -2,14 +2,17 @@ from disepshun.config import *
 from disepshun.world_manager import WorldManager
 from disepshun.player_physics import PlayerPhysics
 from disepshun.game_ui import GameUI
+from disepshun.editor_tools import EditorTools
+from disepshun.presence import DiscordPresence
 import traceback
 import json
 import math
 import shutil
 
-class Disepshun(ShowBase):
+class Disepshun(EditorTools, ShowBase):
     def __init__(self):
         ShowBase.__init__(self)
+        ClockObject.getGlobalClock().setMode(ClockObject.MNormal)
         
         wp = WindowProperties()
         wp.setOrigin(0, 0)
@@ -31,25 +34,29 @@ class Disepshun(ShowBase):
         self.load_settings()
         
         self.sfx = {}
-        for n in ["walk", "jump", "bounce", "toggle", "place", "break"]:
-            try: self.sfx[n] = self.loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, n + ".mp3")))
-            except Exception: pass
-
+        for filename in sorted(os.listdir(SOUND_DIR)):
+            if not filename.endswith('.mp3'): continue
+            self.sfx[filename[:-4]] = self.loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, filename)))
+        self.presence = DiscordPresence(self.saved_settings)
         self.world = WorldManager(self.render, self.loader)
         self.physics = PlayerPhysics(self.render, self.camera, self.world)
         
         self.mouse_sensitivity = 1.0
-        self.keyMap = {k: False for k in ["w","s","a","d","space","lcontrol","mouse1","mouse3","minus","plus","br_l","br_r","z","x"]}
+        self.keyMap = {k: False for k in ["w","s","a","d","space","lshift","rshift","lcontrol","rcontrol","mouse1","mouse3","minus","plus","br_l","br_r","z","x"]}
         self.timers = {k: 0 for k in self.keyMap}; self.repeats = {k: 0 for k in self.keyMap}
+        self.tool_phases = {tool:'select' for tool in self.TOOL_SLOTS}
         self.tool_mode = 1; self.build_material = 1; self.build_dist = 5
         self.hotbar_page = 0 # 0 = Blocks, 1 = Tools
         
+        self.selected_objects = []; self.clipboard = []; self.selection_node = None; self.highlighted_objects = set()
         self.selected_movers = []; self.selected_trampolines = []
         self.wp_node = None; self.wp_markers = []; self.bounce_ghosts = []
+        self.gpu_notice_open = False
         self.is_focused = True; self.menu_open = False; self.paused = False
         self.preview_enabled = True; self.preview_shading = True; self.cur_bounce = 1.3; self.cur_h = 0.0
         self.fly_text_timer = 0.0
         self.spawned_cube_count = 0
+        self.ctrl_group_tap_pending = False
         self.ignore_mouse_input = False
         self.shown_save_error = None
         
@@ -73,6 +80,8 @@ class Disepshun(ShowBase):
         if self.world.saved_checkpoint_pos:
             self.physics.checkpoint = self.world.saved_checkpoint_pos + VBase3(0, 0, 1)
             self.physics.player.setPos(self.physics.checkpoint)
+            ac = self.world.active_checkpoint_cube
+            if ac is not None: self.physics.player.setH(float(ac.getTag("heading") or 0))
         
         self.taskMgr.add(self.update, "update")
         self.taskMgr.add(self.update_world, "worldUpdate")
@@ -81,8 +90,9 @@ class Disepshun(ShowBase):
         self.set_tool(0)
         
         self.center_mouse()
+        self.check_startup_gpu()
 
-    BOOL_SETTINGS = ["Sound", "Particles", "Fly Speed Text", "Block Preview", "Preview Shading", "Visual Floor", "Relative Waypoints", "Shaders"]
+    BOOL_SETTINGS = ["Hide Low Power GPU Warning", "Discord Rich Presence", "Discord Show Activity", "Discord Show Block Count", "Discord Show Time", "Discord Show Icon", "Sound", "Particles", "Fly Speed Text", "Block Preview", "Preview Shading", "Visual Floor", "Use Last Selected as Pivot", "Relative Waypoints", "Shaders"]
 
     def load_settings(self):
         try:
@@ -102,6 +112,10 @@ class Disepshun(ShowBase):
             if k in data and not isinstance(data[k], bool):
                 print(f"Settings: ignoring {k}={data[k]!r} (expected true/false)")
                 del data[k]
+        if 'Use Last Selected as Pivot' not in data and 'Relative Waypoints' in data:
+            data['Use Last Selected as Pivot']=data['Relative Waypoints']
+        data.pop('Relative Waypoints',None)
+        data.pop('Discord Application ID',None)
         self.saved_settings = data
 
     def save_setting(self, key, value):
@@ -177,7 +191,7 @@ class Disepshun(ShowBase):
         return g
 
     def update_bounce_ghosts(self):
-        ts = [t for t in self.selected_trampolines if not t.isEmpty()] if self.tool_mode == 5 else []
+        ts = [t for t in self.selected_trampolines if not t.isEmpty()] if self.tool_mode == 8 else []
         fps = globalClock.getAverageFrameRate(); dt = 1 / round(fps) if fps >= 1 else 1 / 60
         while len(self.bounce_ghosts) < len(ts): self.bounce_ghosts.append((self.make_ghost(self.GHOST_FIRST), self.make_ghost(self.GHOST_MAX)))
         for i, (first, top) in enumerate(self.bounce_ghosts):
@@ -198,38 +212,96 @@ class Disepshun(ShowBase):
 
     def setup_input(self):
         map_key = lambda k, v: self.accept(k, self.update_k, [v, True]) or self.accept(k+"-up", self.update_k, [v, False])
-        for k in ["w","s","a","d","space","lcontrol","z","x"]: map_key("raw-"+k, k)
+        for k in ["w","s","a","d","space","lshift","rshift","lcontrol","rcontrol","z","x"]: map_key("raw-"+k, k)
         for k in ["mouse1","mouse3"]: map_key(k, k)
         map_key("raw-minus", "minus"); map_key("raw-equal", "plus"); map_key("-", "minus"); map_key("=", "plus")
         map_key("raw-[", "br_l"); map_key("raw-]", "br_r")
         
         for i in range(1, 6): self.accept(str(i), self.handle_slot, [i])
         self.accept("q", self.toggle_hotbar)
+        self.accept("tab", self.toggle_tool_phase)
         
         self.accept("wheel_up", self.adj_dist, [1]); self.accept("wheel_down", self.adj_dist, [-1])
         self.accept("r", self.undo_wp); self.accept("f", self.toggle_fly); self.accept("g", self.toggle_god); self.accept("escape", self.toggle_menu)
+        for key,cmd in [('control-c','copy'),('control-x','cut'),('control-v','paste'),('control-a','all'),('control-d','clear')]:
+            self.accept(key,self.left_ctrl_shortcut,[self.selection_command,cmd])
+        self.accept('delete',self.selection_command,['delete'])
+        self.accept('control-z',self.left_ctrl_shortcut,[self.history_step])
+        self.accept('control-y',self.left_ctrl_shortcut,[self.history_step,True])
+        events={'editor-button-down'}
+        for thrower in (getattr(self,'buttonThrowers',None) or []):
+            event=thrower.node().getButtonDownEvent()
+            if not event: event='editor-button-down'; thrower.node().setButtonDownEvent(event)
+            events.add(event)
+        for event in events: self.accept(event,self.note_control_chord)
+        for key, delta in [('arrow_left',(-1,0,0)), ('arrow_right',(1,0,0)), ('arrow_up',(0,1,0)), ('arrow_down',(0,-1,0)), ('page_up',(0,0,1)), ('page_down',(0,0,-1))]:
+            self.accept(key, self.transform_selection, list(delta))
+        self.accept('e', self.transform_selection, [0,0,0,True])
+        self.accept('enter', self.checkpoint_face_camera)
         self.disableMouse()
 
-    def update_k(self, k, s): self.keyMap[k] = s
-    def input_blocked(self): return self.paused or self.menu_open or not self.is_focused
+    def note_control_chord(self, button):
+        if str(button).split('-')[-1] not in ('control','lcontrol','rcontrol'):
+            self.ctrl_group_tap_pending=False
+
+    def left_ctrl_shortcut(self, callback, *args):
+        self.ctrl_group_tap_pending=False
+        if self.input_blocked() or not self.keyMap.get('lcontrol') or self.keyMap.get('rcontrol'): return
+        return callback(*args)
+
+    def update_k(self, k, s):
+        if k in ('lcontrol','rcontrol'):
+            was=self.keyMap.get(k,False); tap=getattr(self,'ctrl_group_tap_pending',False)
+            self.keyMap[k]=s
+            if k=='rcontrol': self.ctrl_group_tap_pending=False; return
+            if s and not was:
+                self.ctrl_group_tap_pending=(self.tool_mode==10 and not self.input_blocked()
+                    and not any(value for key,value in self.keyMap.items() if key!='lcontrol'))
+                for key in ('mouse1','mouse3','z','x','minus','plus'): self.keyMap[key]=False
+            elif not s:
+                self.ctrl_group_tap_pending=False
+                if was and tap and not self.keyMap.get('rcontrol') and not self.input_blocked(): self.group_selection()
+            return
+        if s and (self.keyMap.get('lcontrol') or self.keyMap.get('rcontrol')):
+            self.ctrl_group_tap_pending=False
+            self.keyMap[k]=s if k in ('lshift','rshift') else False
+        else: self.keyMap[k]=s
+    def input_blocked(self): return self.paused or self.menu_open or getattr(self,"gpu_notice_open",False) or not self.is_focused
 
     def userExit(self):
         # Write the last edit before the process ends
+        self.presence.close()
+        if getattr(self, 'glow_filters', None) is not None: self.glow_filters.cleanup()
         self.world.flush_saves()
         ShowBase.userExit(self)
 
     def toggle_menu(self):
+        if getattr(self,"gpu_notice_open",False):
+            self.ui.close_gpu_notice(); return
         self.menu_open = not self.menu_open; self.paused = self.menu_open
+        self.play_sfx("menu_open" if self.menu_open else "menu_close")
+        for k in self.keyMap: self.keyMap[k] = False
+        self.ctrl_group_tap_pending=False
         self.ui.set_menu_visible(self.menu_open)
         wp = WindowProperties(); wp.setCursorHidden(not self.menu_open); self.win.requestProperties(wp)
         if not self.menu_open: self.center_mouse()
 
+    def check_startup_gpu(self):
+        if self.saved_settings.get('Hide Low Power GPU Warning',False): return
+        gsg = self.win.getGsg()
+        if gsg is None: return
+        from disepshun.gpu_advice import check_renderer
+        recommendation = check_renderer(gsg.getDriverRenderer())
+        if recommendation is not None: self.ui.show_gpu_notice(recommendation)
+
     def toggle_fly(self):
         if self.input_blocked(): return
         self.physics.flying = not self.physics.flying; self.physics.vz = 0; self.physics.ground = False
+        self.play_sfx("power_on" if self.physics.flying else "power_off")
     def toggle_god(self):
         if self.input_blocked(): return
         self.physics.god_mode = not self.physics.god_mode; self.world.update_god_collision(self.physics.god_mode)
+        self.play_sfx("power_on" if self.physics.god_mode else "power_off")
     
     def set_visual_floor_visible(self, v): 
         self.world.visual_floor.show() if v else self.world.visual_floor.hide()
@@ -237,6 +309,59 @@ class Disepshun(ShowBase):
 
     def toggle_shaders(self, v):
         self.world.set_shaders_enabled(v)
+        self.set_glow_enabled(v)
+
+    def set_glow_enabled(self, enabled):
+        from direct.filter.CommonFilters import CommonFilters
+        filters = getattr(self, 'glow_filters', None)
+        if not enabled:
+            if filters is not None: filters.cleanup()
+            self.glow_filters = None
+            return
+        if filters is not None: return
+        # Windowless verification has no post-processing target.
+        if not hasattr(self.win, 'getGsg') or self.win.getGsg() is None: return
+        filters = CommonFilters(self.win, self.cam)
+        if filters.setBloom(blend=(0,0,0,1), mintrigger=.05, maxtrigger=.6,
+                            desat=0, intensity=3.0, size='large'):
+            self.glow_filters = filters
+            # Keep strong, broad halos from washing the glowing faces into pastels.
+            vertex = """#version 120
+uniform mat4 p3d_ModelViewProjectionMatrix;
+attribute vec4 p3d_Vertex;
+varying vec2 uv;
+void main() {
+    gl_Position=p3d_ModelViewProjectionMatrix*p3d_Vertex;
+    uv=p3d_Vertex.xz*.5+.5;
+}
+"""
+            fragment = """#version 120
+uniform sampler2D scene;
+uniform sampler2D halo;
+uniform vec2 scene_scale;
+uniform vec2 halo_scale;
+varying vec2 uv;
+void main() {
+    vec4 base=texture2D(scene,uv*scene_scale);
+    float core=smoothstep(.55,.85,base.a);
+    vec3 surface=clamp(base.rgb*mix(1.0,1.15,core),0.0,1.0);
+    vec3 glow=clamp(texture2D(halo,uv*halo_scale).rgb*.5,0.0,1.0);
+    float pureRed=step(max(glow.g,glow.b)*3.0+.005,glow.r);
+    glow.r=min(1.0,glow.r*mix(1.0,2.0,pureRed));
+    vec3 combined=1.0-(1.0-glow)*(1.0-surface);
+    gl_FragColor=vec4(mix(combined,surface,core),1.0);
+}
+"""
+            filters.finalQuad.setShader(Shader.make(Shader.SL_GLSL,vertex=vertex,fragment=fragment))
+            filters.finalQuad.setShaderInput('scene',filters.textures['color'])
+            filters.finalQuad.setShaderInput('halo',filters.textures['bloom3'])
+            for name,key in (('scene','color'),('halo','bloom3')):
+                scale=filters.textures[key].getTexScale()
+                filters.finalQuad.setShaderInput(name+'_scale',Vec2(scale.x,scale.y))
+        else:
+            filters.cleanup()
+            self.glow_filters = None
+            print('Glow bloom could not be enabled on this graphics device.')
 
     def toggle_preview_shading(self, v):
         self.preview_shading = v
@@ -257,7 +382,14 @@ class Disepshun(ShowBase):
     def play_sfx(self, name, rate=1.0, volume=1.0):
         s = self.sfx.get(name)
         if not s or not self.sound_enabled: return
+        # Preserve checkpoint playback; other cues vary subtly on every play.
+        if name != 'checkpoint':
+            rate *= random.uniform(.95,1.05)
+            volume *= random.uniform(.94,1.0)
         s.stop(); s.setPlayRate(rate); s.setVolume(volume); s.play()
+
+    def play_adjustment(self, name, direction):
+        self.play_sfx(name,1.12 if direction>0 else .88)
 
     def toggle_particles(self, v): 
         self.particles_enabled = v
@@ -280,18 +412,20 @@ class Disepshun(ShowBase):
         if self.hotbar_page == 0:
             self.set_tool(i)
         elif self.hotbar_page == 1:
-            # Map slot 1 to Movement Tool (ID 7)
-            if i == 1: self.set_tool(7)
+            # Tool slots are independent from block material IDs.
+            self.set_tool(self.TOOL_SLOTS[i-1])
 
     def set_tool(self, m):
         if self.tool_mode == m: m = 0
         self.tool_mode = m
-        if m == 7: self.build_material = 0; self.preview.hide(); self.deselect_trampolines(); self.update_hud()
-        else:
-            self.build_material = m; self.deselect_movers()
-            if m == 5: self.update_hud()
-            else: self.deselect_trampolines(); self.ui.tool_text.setText("")
-        
+        self.selected_objects = []
+        self.refresh_object_selection()
+        self.deselect_movers(); self.deselect_trampolines()
+        self.build_material = m if 1 <= m <= 5 else 0
+        self.preview.hide()
+        self.play_sfx('tool_equip' if m else 'tool_unequip')
+        self.update_hud()
+
         # Color mapping for preview
         c = {
             1: (1, 1, 1, 1),
@@ -317,90 +451,70 @@ class Disepshun(ShowBase):
         if self.hotbar_page == 0:
             if 1 <= m <= 5: v_idx = m - 1
         else:
-            if m == 7: v_idx = 0
+            if m in self.TOOL_SLOTS: v_idx = self.TOOL_SLOTS.index(m)
         
         self.ui.update_selection(v_idx)
+        name = self.TOOL_NAMES.get(m, {1:'White',2:'Gray',3:'Hazard',4:'Checkpoint',5:'Trampoline'}.get(m, ''))
+        self.ui.show_item_name(name + (' Tool' if m in self.TOOL_SLOTS else ''))
 
     def adj_dist(self, d): 
+        if not self.is_focused: return
         if self.menu_open:
             self.ui.scroll_menu(d)
-        else:
+        elif not self.paused:
             self.build_dist = max(1, min(20, self.build_dist + d))
     
     def adj_val(self, d):
-        if self.tool_mode == 7 and self.selected_movers:
-            for m in self.selected_movers: m['speed'] = max(0.5, round(m['speed'] + d*0.5, 1))
-            self.update_hud(); self.world.map_is_dirty = True; self.world.save_map()
-        elif self.tool_mode == 5:
-            if self.selected_trampolines:
-                self.cur_bounce = max(0.1, round(self.cur_bounce + d*0.1, 1))
-                for t in self.selected_trampolines: t.setTag("bounciness", str(self.cur_bounce))
-                self.world.map_is_dirty = True; self.world.save_map()
-                self.update_hud()
+        if not self.tinkering(): return
+        if self.tool_mode==9: return self.adjust_checkpoint(d)
+        if self.tool_mode==7:
+            nodes=self.selected_objects or [m['np'] for m in self.selected_movers]
+            if not nodes: return
+            token=self.begin_edit(nodes); self.ensure_selected_movers()
+            for m in self.selected_movers: m['speed']=min(1000.0,max(.5,round(m['speed']+d*.5,1)))
+            self.finish_edit(token,[m['np'] for m in self.selected_movers],'mover_speed')
+            self.update_hud(); self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment('mover_speed',d)
+        elif self.tool_mode==8 and self.selected_trampolines:
+            token=self.begin_edit(self.selected_trampolines)
+            self.cur_bounce=min(100,max(.1,round(self.cur_bounce+d*.1,1)))
+            for t in self.selected_trampolines: t.setTag('bounciness',str(self.cur_bounce))
+            self.finish_edit(token,self.selected_trampolines,'trampoline_bounce')
+            self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment('trampoline_bounce',d); self.update_hud()
 
     def adj_h(self, d):
-        if self.tool_mode == 5:
-            if self.selected_trampolines:
-                self.cur_h = max(0.0, round(self.cur_h + d*0.5, 1))
-                for t in self.selected_trampolines: t.setTag("max_height", str(self.cur_h))
-                self.world.map_is_dirty = True; self.world.save_map()
-                self.update_hud()
+        if not self.tinkering(): return
+        if self.tool_mode==8 and self.selected_trampolines:
+            token=self.begin_edit(self.selected_trampolines)
+            self.cur_h=min(10000,max(0,round(self.cur_h+d*.5,1)))
+            for t in self.selected_trampolines: t.setTag('max_height',str(self.cur_h))
+            self.finish_edit(token,self.selected_trampolines,'trampoline_height')
+            self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment('trampoline_height',d); self.update_hud()
 
     def adj_fly(self, d):
-        self.physics.fly_speed = max(1.0, round(self.physics.fly_speed + d, 1))
+        previous = self.physics.fly_speed
+        self.physics.fly_speed = max(1.0, round(previous + d, 1))
+        if self.physics.fly_speed != previous: self.play_adjustment('flight_speed',self.physics.fly_speed-previous)
         if not self.ui.gui_hidden and self.fly_text_enabled:
             self.ui.fly_text.setText(f"Fly Speed: {self.ui.format_number(self.physics.fly_speed)}"); self.ui.fly_text.show(); self.ui.fly_text.setAlphaScale(1.0); self.fly_text_timer = 3.0
 
     def handle_sel(self, mode):
-        self.cTrav.traverse(self.render)
-        if self.cHandler.getNumEntries() > 0:
-            self.cHandler.sortEntries(); np = self.cHandler.getEntry(0).getIntoNodePath(); p = np.getParent()
-            if mode == 7:
-                for mc in self.world.moving_cubes:
-                    if mc['np'] == p: return self.toggle_mov(mc)
-                if p in self.world.cubes and p != self.world.god_collision_floor:
-                    spd = self.selected_movers[0]['speed'] if self.selected_movers else 3.0
-                    wps = []
-                    if self.selected_movers:
-                        ref = self.selected_movers[0]
-                        for w in ref['waypoints']: wps.append(p.getPos() + (w - ref['origin']))
-                    mc = self.world.convert_to_mover(p, {'waypoints': wps, 'speed': spd, 'current_idx': 0, 'wait_timer': 0, 'origin': p.getPos(), 'direction': 1})
-                    self.toggle_mov(mc); self.world.map_is_dirty = True; self.world.save_map()
-            elif mode == 5 and p in self.world.cubes and p.getTag("material") == "5":
-                if p in self.selected_trampolines: 
-                    p.clearColorScale(); p.setColor(0,0,1,1)
-                    self.selected_trampolines.remove(p)
-                    self.world.request_chunk_update(p.getPos())
-                else: 
-                    p.clearColorScale(); p.setColor(0,1,0,1)
-                    self.selected_trampolines.append(p)
-                    self.world.request_chunk_update(p.getPos())
-                    self.cur_bounce = float(p.getTag("bounciness") or 1.3)
-                    self.cur_h = float(p.getTag("max_height") or 0.0)
-                self.update_hud()
+        if mode == 7: return self.select_object()
 
     def handle_place_wp(self):
+        if not self.tinkering() or self.tool_mode != 7: return
         if self.preview.getZ() < -19.5: return # Same world-height rule as block placement; visibility is only a display setting
+        nodes=self.selected_objects or [m['np'] for m in self.selected_movers]
+        if not nodes: return
+        token=self.begin_edit(nodes)
+        self.ensure_selected_movers()
         pos = self.preview.getPos(); c = len(self.selected_movers)
         if c > 0:
-            avg = VBase3(sum(m['origin'].x for m in self.selected_movers), sum(m['origin'].y for m in self.selected_movers), sum(m['origin'].z for m in self.selected_movers)) / c
-            
-            # Use last selected block as origin if centroid is off-grid (e.g. 2 blocks) OR if setting is enabled
-            use_last = self.saved_settings.get("Relative Waypoints", False)
-            is_off_grid = (abs(avg.x - round(avg.x)) > 0.01 or abs(avg.y - round(avg.y)) > 0.01)
-
-            ref = avg
-            if use_last or is_off_grid:
-                ref = self.selected_movers[-1]['origin']
+            ref = self.reference_point([m['origin'] for m in self.selected_movers])
 
             off = pos - ref
             for m in self.selected_movers: m['waypoints'].append(m['origin'] + off)
-            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map()
-
-    def toggle_mov(self, mc):
-        if mc in self.selected_movers: mc['np'].clearColorScale(); self.selected_movers.remove(mc)
-        else: mc['np'].setColorScale(0.5,0.5,1.5,1); self.selected_movers.append(mc)
-        self.draw_wp(); self.update_hud()
+            self.finish_edit(token,[m['np'] for m in self.selected_movers],'waypoint_add')
+            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map(); self.play_sfx("waypoint_add")
 
     def deselect_movers(self):
         for m in self.selected_movers: m['np'].clearColorScale()
@@ -413,12 +527,14 @@ class Disepshun(ShowBase):
         self.selected_trampolines = []
 
     def undo_wp(self):
-        if self.input_blocked(): return
+        if not self.tinkering(): return
         if self.tool_mode == 7 and self.selected_movers:
+            token=self.begin_edit([m['np'] for m in self.selected_movers])
             for m in self.selected_movers:
                 if m['waypoints']: 
                     m['waypoints'].pop()
-            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map()
+            self.finish_edit(token,[m['np'] for m in self.selected_movers],'waypoint_remove')
+            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map(); self.play_sfx("waypoint_remove")
 
     def draw_wp(self):
         if self.wp_node: self.wp_node.removeNode(); self.wp_node = None
@@ -438,16 +554,34 @@ class Disepshun(ShowBase):
         self.wp_node = self.render.attachNewNode(ls.create()); self.wp_node.setDepthTest(False); self.wp_node.setBin("fixed", 1)
 
     def update_hud(self):
+        if self.tool_mode not in self.TOOL_SLOTS:
+            self.ui.tool_text.setText(''); return
         fmt = self.ui.format_number
-        if self.tool_mode == 7:
-            self.ui.tool_text.setText(f"WAYPOINT TOOL\nSelected: {len(self.selected_movers)}\nSpeed: {fmt(self.selected_movers[-1]['speed'] if self.selected_movers else 3.0)} [-/+]\n[R] Undo | [L-Click] Select | [R-Click] Add" if self.selected_movers else "WAYPOINT TOOL\nSelect blocks (L-Click)")
-        elif self.tool_mode == 5:
-            if self.selected_trampolines:
-                b, h = self.cur_bounce, self.cur_h
-                self.ui.tool_text.setText(f"TRAMPOLINE TOOL\nSelected: {len(self.selected_trampolines)}\nBounce: {fmt(b)} [-/+]\nMax H: {fmt(h)} [Z/X]\n[L-Click] Select")
-            else:
-                self.ui.tool_text.setText("TRAMPOLINE TOOL\nSelect blocks (L-Click)")
-        else: self.ui.tool_text.setText("")
+        combined = self.tool_mode in self.COMBINED_TOOLS
+        phase = self.tool_phases[self.tool_mode]
+        count = len(self.selected_objects)
+        mode_hint = '' if combined else f" | {phase.upper()} [Tab]"
+        header = f"{self.TOOL_NAMES[self.tool_mode].upper()} TOOL{mode_hint}\nSelected: {count}\n"
+        self.ui.tool_text.setFg(self.SELECTION_COLORS[self.tool_mode])
+        if not combined and phase == 'select':
+            body = '[L-Click] Select / deselect'
+            if self.tool_mode == 11: body += '\n[LCtrl+A/D] Select all / Clear'
+            body += '\n[Tab] Tinker with selection'
+        elif self.tool_mode == 7:
+            speed = self.selected_movers[-1]['speed'] if self.selected_movers else 3.0
+            body = f'Speed: {fmt(speed)} [-/+]\n[R-Click] Add waypoint | [R] Undo waypoint'
+        elif self.tool_mode == 8:
+            body = f'[L-Click] Select / deselect\nBounce: {fmt(self.cur_bounce)} [-/+]\nMax H: {fmt(self.cur_h)} [Z/X]'
+        elif self.tool_mode == 9:
+            heading = float(self.selected_objects[-1].getTag('heading') or 0) if self.selected_objects else 0
+            body = f'[L-Click] Select / deselect\nFacing: {heading:.0f}\n[-/+] Turn 15 degrees | [Enter] Face camera'
+        elif self.tool_mode == 10:
+            body = '[L-Click] Select / deselect\n[LCtrl] Group / Ungroup'
+        else:
+            body = ('[R-Click] Move here | [Arrows / PgUp/PgDn] Move\n'
+                    '[E] Rotate | [Delete] Delete\n[LCtrl+C/X/V] Copy / Cut / Paste')
+        if self.tool_mode==11: body+='\nCyan point: center / pivot'
+        self.ui.tool_text.setText(header + body)
 
     def repeat(self, k, t, f):
         if self.keyMap[k]:
@@ -456,16 +590,27 @@ class Disepshun(ShowBase):
         else: self.timers[k] = 0
 
     def update(self, task):
+        filters=getattr(self,'glow_filters',None)
+        if filters is not None:
+            for name,key in (('scene','color'),('halo','bloom3')):
+                scale=filters.textures[key].getTexScale()
+                filters.finalQuad.setShaderInput(name+'_scale',Vec2(scale.x,scale.y))
+        self.presence.tick('In settings' if self.menu_open else self.TOOL_NAMES.get(self.tool_mode, 'Building' if self.build_material else 'Exploring'), len(self.world.cubes)+len(self.world.moving_cubes)-int(self.physics.god_mode and not self.world.visual_floor.isHidden()))
         foc = (self.win.getWindowHandle().getIntHandle() == user32.GetForegroundWindow()) if user32 else self.win.getProperties().getForeground()
         if foc != self.is_focused:
             self.is_focused = foc; wp = WindowProperties()
-            wp.setCursorHidden(False if self.menu_open or not foc else True); wp.setZOrder(WindowProperties.Z_top if foc else WindowProperties.Z_normal); self.win.requestProperties(wp)
-            if self.is_focused and not self.menu_open:
+            if not foc:
+                self.ctrl_group_tap_pending=False
+                for key in self.keyMap: self.keyMap[key]=False
+            wp.setCursorHidden(False if self.menu_open or getattr(self,"gpu_notice_open",False) or not foc else True); wp.setZOrder(WindowProperties.Z_top if foc else WindowProperties.Z_normal); self.win.requestProperties(wp)
+            if self.is_focused and not self.menu_open and not getattr(self,"gpu_notice_open",False):
                 self.center_mouse()
                 self.ignore_mouse_input = True
         
         if not foc: return task.cont
         dt = globalClock.getDt(); t = globalClock.getFrameTime()
+        self.ui.update_item_name(dt)
+        self.ui.update_presence_status()
         self.ui.fps_text.setText(f"FPS: {round(globalClock.getAverageFrameRate())}")
         
         if self.fly_text_timer > 0 and not self.paused:
@@ -478,12 +623,12 @@ class Disepshun(ShowBase):
 
         if self.keyMap["mouse3"]:
             if self.timers["mouse3"] == 0: self.place(); self.timers["mouse3"] = t; self.repeats["mouse3"] = t + 0.5
-            elif t >= self.repeats["mouse3"]: self.place(); self.repeats["mouse3"] = t + 0.1
+            elif t >= self.repeats["mouse3"] and self.tool_mode not in self.TOOL_SLOTS: self.place(); self.repeats["mouse3"] = t + 0.1
         else: self.timers["mouse3"] = 0
         
         if self.keyMap["mouse1"]:
             if self.timers["mouse1"] == 0: self.delete(); self.timers["mouse1"] = t; self.repeats["mouse1"] = t + 0.5
-            elif t >= self.repeats["mouse1"]: self.delete(); self.repeats["mouse1"] = t + 0.1
+            elif t >= self.repeats["mouse1"] and self.tool_mode not in self.TOOL_SLOTS: self.delete(); self.repeats["mouse1"] = t + 0.1
         else: self.timers["mouse1"] = 0
 
         self.repeat("minus", t, self.adj_val); self.repeat("plus", t, self.adj_val)
@@ -504,7 +649,7 @@ class Disepshun(ShowBase):
         self.physics.update(dt, self.keyMap)
         if not self.physics.god_mode and self.physics.player.getZ() < -20: self.physics.respawn()
 
-        if (self.tool_mode == 7 or self.build_material != 0):
+        if ((self.tool_mode in (7, 11) and self.tinkering()) or self.build_material != 0):
             self.cTrav.traverse(self.render)
             pl = VBase3(); ok = False
             if self.cHandler.getNumEntries() > 0:
@@ -543,8 +688,11 @@ class Disepshun(ShowBase):
         else: 
             self.preview.hide()
 
+        self.refresh_object_selection()
+        self.draw_checkpoint_direction()
         self.update_bounce_ghosts()
-        self.world.update_chunks()
+        self.world.update_chunks(budget_seconds=.0025)
+        self.world.update_glow_lights(self.camera.getPos(self.render))
         self.world.retry_save(t)
         if self.world.save_error != self.shown_save_error:
             self.shown_save_error = self.world.save_error
@@ -593,11 +741,15 @@ class Disepshun(ShowBase):
                 # Blocks moving in lockstep with the carrier can't block the rider
                 same = [m['np'] for m in self.world.moving_cubes if id(m) in moved and (moved[id(m)] - move).lengthSquared() < 1e-10]
                 self.physics.carry(move, ignore=same)
+        self.draw_selection_center()
         return task.cont
 
     def place(self):
         if self.input_blocked(): return
-        if self.tool_mode == 7: return self.handle_place_wp() if self.selected_movers else None
+        if self.tool_mode == 11: return self.transform_selection(to_cursor=True)
+        if self.tool_mode == 10: return
+        if self.tool_mode in (8, 9): return
+        if self.tool_mode == 7: return self.handle_place_wp()
         if self.build_material == 0: return
         if self.preview.getZ() < -19.5: return
         pos = self.preview.getPos()
@@ -616,6 +768,7 @@ class Disepshun(ShowBase):
         if self.cHandler.getNumEntries() > 0:
             self.cHandler.sortEntries(); target = self.world.find_mover(self.cHandler.getEntry(0).getIntoNodePath().getParent())
 
+        token=self.begin_edit([])
         self.spawned_cube_count += 1
         c = self.world.get_cube(f"c_{self.spawned_cube_count}")
         mat = self.build_material
@@ -636,7 +789,8 @@ class Disepshun(ShowBase):
             self.world.cubes.append(c); self.world.cube_map[k] = c
             self.world.register_cube(c)
             self.world.request_chunk_update(pos)
-        self.world.map_is_dirty = True; self.world.save_map()
+        self.finish_edit(token,[c],'place')
+        self.world.queue_save()
         self.play_sfx("place", random.uniform(0.95, 1.05))
 
         pos = c.getPos(); pp = self.physics.player.getPos()
@@ -646,7 +800,7 @@ class Disepshun(ShowBase):
     def delete(self):
         if self.input_blocked(): return
         if self.tool_mode == 7: return self.handle_sel(7)
-        elif self.tool_mode == 5: return self.handle_sel(5)
+        elif self.tool_mode in (8, 9, 10, 11): return self.select_object()
         self.cTrav.traverse(self.render)
         if self.cHandler.getNumEntries() > 0:
             self.cHandler.sortEntries(); np = self.cHandler.getEntry(0).getIntoNodePath(); p = np.getParent()
@@ -660,15 +814,9 @@ class Disepshun(ShowBase):
                 if k in self.world.cube_map:
                     target = self.world.cube_map[k]
 
-            mc = self.world.find_mover(target)
-            if mc and mc in self.selected_movers: self.selected_movers.remove(mc); self.draw_wp(); self.update_hud()
-            if target in self.selected_trampolines: self.selected_trampolines.remove(target)
-            was_cp = target == self.world.active_checkpoint_cube
-            if self.world.remove_block(target):
-                # Checkpoint block gone: fall back to the default spawn
-                if was_cp: self.physics.checkpoint = VBase3(0, 0, 1)
-                self.world.map_is_dirty = True; self.world.save_map()
-                self.play_sfx("break", random.uniform(0.95, 1.05))
+            if self.delete_objects([target]):
+                self.world.map_is_dirty=True; self.world.save_map()
+                self.play_sfx('break',random.uniform(.95,1.05))
 
 try:
     app = Disepshun()

@@ -20,6 +20,9 @@ class PlayerPhysics:
         self.flying = False; self.fly_speed = 10.0; self.god_mode = False
         self.checkpoint = VBase3(0, 0, 1); self.just_respawned = False
         self.checkpoint_pitch = 1.0
+        self.checkpoint_activated_this_update = False
+        self.fall_peak_z = self.player.getZ()
+        self.pending_land = None
         self.step_dist = 0.0; self.step_len = 1.6 # Ground distance between footstep sounds
         self.particles = ParticleSystem(self.render)
         try: self.respawn_sfx = loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, "respawn.mp3")))
@@ -38,13 +41,17 @@ class PlayerPhysics:
         print(f"Respawning at {self.checkpoint}...")
         self.checkpoint_pitch = 1.0
         if self.respawn_sfx and hasattr(builtins.base, 'sound_enabled') and builtins.base.sound_enabled:
-            self.respawn_sfx.setTime(0.5)
+            self.respawn_sfx.setPlayRate(random.uniform(.95,1.05))
+            self.respawn_sfx.setVolume(random.uniform(.94,1.0))
+            self.respawn_sfx.setTime(.5)
             self.respawn_sfx.play()
         ac = self.world_manager.active_checkpoint_cube
         if ac is not None and not ac.isEmpty() and not ac.getParent().isEmpty():
             self.checkpoint = ac.getPos(self.render) + VBase3(0, 0, 1)
         self.player.setPos(self.checkpoint)
-        self.player.setHpr(0, 0, 0)
+        self.fall_peak_z=self.player.getZ()
+        self.pending_land = None
+        self.player.setHpr(float(ac.getTag("heading") or 0) if ac is not None and not ac.isEmpty() else 0, 0, 0)
         self.camera.setP(0)
         self.vz = 0; self.ground = False; self.coyote = 0.0; self.just_respawned = True; self.start_cyan_effect()
         
@@ -54,9 +61,11 @@ class PlayerPhysics:
             win.movePointer(0, cx, cy)
 
     def activate_checkpoint(self, cube):
+        if cube == self.world_manager.active_checkpoint_cube: return False
+        if cube is None or cube.isEmpty() or cube.getTag('material') != '4': return False
         if self.checkpoint_sfx and hasattr(builtins.base, 'sound_enabled') and builtins.base.sound_enabled:
             self.checkpoint_sfx.setPlayRate(self.checkpoint_pitch)
-            self.checkpoint_sfx.setTime(0.3)
+            self.checkpoint_sfx.setTime(.3)
             self.checkpoint_sfx.play()
             self.checkpoint_pitch += 0.1
 
@@ -72,7 +81,8 @@ class PlayerPhysics:
             self.world_manager.update_cube_faces(old_active)
         self.world_manager.update_cube_faces(cube)
         
-        self.world_manager.map_is_dirty = True; self.world_manager.save_map()
+        self.world_manager.queue_save()
+        return True
 
     def get_contacts(self, p_pos, h, ignore=()):
         """Side-effect-free overlap query. Returns (out_of_bounds_or_floor, [overlapping cubes])."""
@@ -106,13 +116,21 @@ class PlayerPhysics:
         return floor, hits
 
     def handle_contacts(self, hits):
-        """Apply contact events with fixed precedence: lethal first, then the nearest checkpoint."""
+        """Lethal contacts take precedence; touching the active checkpoint retains it."""
         if self.god_mode or not hits: return
-        if any(c.getTag("material") == "3" for c in hits): self.respawn(); return
-        cps = [c for c in hits if c.getTag("material") == "4" and c != self.world_manager.active_checkpoint_cube]
-        if cps:
-            pp = self.player.getPos(self.render)
-            self.activate_checkpoint(min(cps, key=lambda c: (c.getPos(self.render) - pp).lengthSquared()))
+        if any(c.getTag('material') == '3' for c in hits): self.respawn(); return
+        cps = [c for c in hits if c.getTag('material') == '4']
+        if not cps or self.checkpoint_activated_this_update: return
+        active = self.world_manager.active_checkpoint_cube
+        if active in cps: return
+        pp = self.player.getPos(self.render)
+        # Collision probes can see only one side of a seam. Include the player's
+        # actual body/support contacts before deciding it has left its checkpoint.
+        if active is not None:
+            _, actual = self.get_contacts(pp-VBase3(0,0,.02), self.player_height+.02)
+            if active in actual: return
+        target = min(cps, key=lambda c: ((c.getPos(self.render)-pp).lengthSquared(), tuple(c.getPos(self.render))))
+        if self.activate_checkpoint(target): self.checkpoint_activated_this_update = True
 
     def check_collision(self, p_pos, h, trigger_events=True, ignore=()):
         floor, hits = self.get_contacts(p_pos, h, ignore)
@@ -141,6 +159,7 @@ class PlayerPhysics:
         pp = self.player.getPos() + VBase3(0, 0, dz)
         if not self.check_collision(pp, self.player_height):
             self.player.setPos(pp); self.ground = False
+            self.fall_peak_z=max(self.fall_peak_z,self.player.getZ())
             return False
         if self.just_respawned: return True
         if self.vz > 0: self.vz = 0; return True
@@ -178,6 +197,11 @@ class PlayerPhysics:
             builtins.base.play_sfx("bounce", random.uniform(0.95, 1.05))
             return True
         if hgz > -10000:
+            drop=max(0,self.fall_peak_z-hgz)
+            if not self.ground and abs(self.vz)>1.5 and drop>.06 and not keys['space']:
+                severity=min(1,math.sqrt(drop/30))
+                self.pending_land = (.08,1.25-.65*severity,.2+.8*severity)
+            self.fall_peak_z=hgz
             self.player.setZ(hgz); self.vz = 0; self.ground = True
             return True
         self.player.setPos(pp); self.ground = False
@@ -223,10 +247,28 @@ class PlayerPhysics:
         except ValueError: return default
         return v if math.isfinite(v) and v >= lo else default
 
+    def update_landing_sound(self, dt, keys):
+        if self.pending_land is None: return
+        # Allow a jump immediately after contact to cancel the landing cue.
+        if keys['space'] or self.flying or self.just_respawned:
+            self.pending_land = None
+            return
+        delay,pitch,volume = self.pending_land
+        delay -= dt
+        if delay <= 0:
+            self.pending_land = None
+            builtins.base.play_sfx('land',pitch,volume)
+        else:
+            self.pending_land = (delay,pitch,volume)
+
     def update(self, dt, keys):
+        self.checkpoint_activated_this_update = False
         self.particles.update(dt)
         if self.just_respawned: self.just_respawned = False; return
         dt = min(dt, 0.1)
+        self.update_landing_sound(dt, keys)
+        self.fall_peak_z=self.player.getZ() if self.ground or self.flying else max(self.fall_peak_z,self.player.getZ())
+        crouching = keys.get("lshift", False) or keys.get("rshift", False)
 
         if self.flying:
             v = VBase3(0,0,0); q = self.camera.getQuat(self.render); f = q.getForward(); f.setZ(0); f.normalize(); r = q.getRight(); r.setZ(0); r.normalize()
@@ -235,10 +277,10 @@ class PlayerPhysics:
             if keys["a"]: v -= r
             if keys["d"]: v += r
             if keys["space"]: v.z += 1
-            if keys["lcontrol"]: v.z -= 1
+            if crouching: v.z -= 1
             if v.lengthSquared() > 0: self.player.setPos(self.player.getPos() + v.normalized() * self.fly_speed * dt)
         else:
-            wants_crouch = keys["lcontrol"]
+            wants_crouch = crouching
             if not wants_crouch:
                 if self.check_collision(self.player.getPos(), self.h_stand, trigger_events=False):
                     wants_crouch = True
@@ -260,7 +302,7 @@ class PlayerPhysics:
             if self.just_respawned: return
             self.coyote = self.coyote_time if self.ground else max(0.0, self.coyote - dt)
 
-            sp = 2.0 if keys["lcontrol"] else 5.0
+            sp = 2.0 if crouching else 5.0
             mv = VBase3(0,0,0)
             if keys["w"]: mv.y += 1
             if keys["s"]: mv.y -= 1
@@ -273,7 +315,7 @@ class PlayerPhysics:
                 next_x = self.player.getPos() + VBase3(ov.x, 0, 0)
                 if not self.check_collision(next_x, self.player_height): 
                     can_move = True
-                    if keys["lcontrol"] and self.ground:
+                    if crouching and self.ground:
                         if not self.check_collision(next_x - VBase3(0, 0, 0.1), self.player_height, trigger_events=False):
                             can_move = False
                     if can_move:
@@ -282,7 +324,7 @@ class PlayerPhysics:
                 next_y = self.player.getPos() + VBase3(0, ov.y, 0)
                 if not self.check_collision(next_y, self.player_height): 
                     can_move = True
-                    if keys["lcontrol"] and self.ground:
+                    if crouching and self.ground:
                         if not self.check_collision(next_y - VBase3(0, 0, 0.1), self.player_height, trigger_events=False):
                             can_move = False
                     if can_move:
@@ -290,7 +332,7 @@ class PlayerPhysics:
 
                 if self.ground and not self.just_respawned:
                     d = self.player.getPos() - start; self.step_dist += math.hypot(d.x, d.y)
-                    if self.step_dist >= self.step_len * (0.5 if keys["lcontrol"] else 1.0):
+                    if self.step_dist >= self.step_len * (0.5 if crouching else 1.0):
                         self.step_dist = 0.0
-                        builtins.base.play_sfx("walk", random.uniform(0.85, 1.15), 0.15 if keys["lcontrol"] else 0.3)
+                        builtins.base.play_sfx("walk", random.uniform(0.85, 1.15), 0.15 if crouching else 0.3)
             else: self.step_dist = self.step_len * 0.7 # First step sounds soon after starting to walk

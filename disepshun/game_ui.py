@@ -58,6 +58,9 @@ class GameUI:
         self.selection_indicator.setBin("fixed", 2)
         self.selection_indicator.hide()
         
+        self.item_name = OnscreenText(text='', parent=self.inv_node, pos=(0,.12), scale=.05, fg=(1,1,1,1))
+        self.item_name_time = 0.0
+        self.item_name.hide()
         # Initialize default view (Page 0: Blocks)
         self.update_hotbar_layout(0)
 
@@ -73,27 +76,28 @@ class GameUI:
         return slot, card
 
     def update_hotbar_layout(self, page):
-        # Page 0: Building Blocks (Materials 1-5)
-        # Page 1: Tools (Only slot 1 visible, centered)
-        
-        if page == 0:
-            # Show all 5 slots and reset positions
-            for i, slot in enumerate(self.inv_slots):
-                slot.show()
-                slot.setX(self.slot_orig_x[i])
-                
-            # Colors for blocks 1-5: White, Gray, Red, Green, Blue
-            colors = [(1,1,1,1), (0.4,0.4,0.4,1), (1,0,0,1), (0,1,0,1), (0,0,1,1)]
-            for i, col in enumerate(colors):
-                self.inv_cards[i].setColor(col)
-        else:
-            # Show only the first slot, center it, hide the rest
-            self.inv_slots[0].show()
-            self.inv_slots[0].setX(0.0) # Center the single tool slot
-            self.inv_cards[0].setColor((1,0,1,1)) # Magenta for Movement Tool
-            
-            for i in range(1, 5):
-                self.inv_slots[i].hide()
+        colors = ([(1,1,1,1), (.4,.4,.4,1), (1,0,0,1), (0,1,0,1), (0,0,1,1)]
+                  if page == 0 else [(1,0,1,1), (0,.3,1,1), (0,1,.4,1), (1,.65,0,1), (0,1,1,1)])
+        for i, slot in enumerate(self.inv_slots):
+            slot.show(); slot.setX(self.slot_orig_x[i])
+            self.inv_cards[i].setColor(colors[i])
+
+    def show_item_name(self, name):
+        self.item_name.setText(name)
+        self.item_name_time = 2.0 if name else 0.0
+        self.item_name.setAlphaScale(1)
+        self.item_name.show() if name else self.item_name.hide()
+
+    def update_item_name(self, dt):
+        self.item_name_time = max(0.0, self.item_name_time-dt)
+        if self.item_name_time <= 0: self.item_name.hide()
+        else: self.item_name.setAlphaScale(min(1, self.item_name_time/.7))
+
+    def update_presence_status(self):
+        text = self.base.presence.connection_status
+        if self.presence_status['text'] != text:
+            self.presence_status['text'] = text
+            self.layout_settings()
 
     def drag_start(self, event):
         if self.base.mouseWatcherNode.hasMouse():
@@ -111,6 +115,11 @@ class GameUI:
         self.base.taskMgr.remove("drag_menu_task")
 
     def scroll_menu(self, direction):
+        if not self.base.menu_open or not self.base.is_focused or not self.base.mouseWatcherNode.hasMouse(): return
+        mouse = self.base.mouseWatcherNode.getMouse()
+        point = self.menu_frame.getRelativePoint(self.base.aspect2d, Point3(mouse.x * self.base.getAspectRatio(), 0, mouse.y))
+        left, right, bottom, top = self.menu_frame['frameSize']
+        if not (left <= point.x <= right and bottom <= point.z <= top): return
         if not hasattr(self, 'scroll_frame') or not self.scroll_frame: return
         bar = self.scroll_frame.verticalScroll
         val = bar['value']
@@ -131,8 +140,8 @@ class GameUI:
     def bind_scroll_events(self, widget):
         """Recursively bind scroll events to a widget and its children if needed"""
         if not widget: return
-        widget.bind('wheel_up', lambda e: self.scroll_menu(1))
-        widget.bind('wheel_down', lambda e: self.scroll_menu(-1))
+        widget.bind('press-wheel_up-', lambda e: self.scroll_menu(1))
+        widget.bind('press-wheel_down-', lambda e: self.scroll_menu(-1))
 
     def create_settings_menu(self):
         self.menu_frame = DirectFrame(frameColor=(0.1, 0.1, 0.1, 0.95), frameSize=(-0.5, 0.35, -0.5, 0.75), pos=(0, 0, 0), state=DGG.NORMAL)
@@ -158,22 +167,23 @@ class GameUI:
             ("Block Preview", lambda v: self.base.set_preview_enabled(v), True),
             ("Preview Shading", lambda v: self.base.toggle_preview_shading(v), True),
             ("Visual Floor", lambda v: self.base.set_visual_floor_visible(v), False),
-            ("Relative Waypoints", lambda v: None, False), # Handled in Main via saved_settings
-            ("Shaders", lambda v: self.base.toggle_shaders(v), True)
+            ("Use Last Selected as Pivot", lambda v: None, False), # Handled in Main via saved_settings
+            ("Shaders", lambda v: self.base.toggle_shaders(v), True),
+            ("Discord Rich Presence", lambda v: self.base.presence.configure(enabled=v), True),
+            ("Discord Show Activity", lambda v: self.base.presence.configure(show_activity=v), True),
+            ("Discord Show Block Count", lambda v: self.base.presence.configure(show_block_count=v), True),
+            ("Discord Show Time", lambda v: self.base.presence.configure(show_time=v), True),
+            ("Discord Show Icon", lambda v: self.base.presence.configure(show_icon=v), True)
         ]
 
-        # Calculate exact canvas height based on items to prevent scrolling past content
         start_y = -0.05
         step = 0.11
-        rows = len(opts)
-        last_item_y = start_y - ((rows - 1) * step)
-        canvas_bottom = last_item_y - 0.06
-
         self.scroll_frame = DirectScrolledFrame(
             parent=self.menu_frame,
+            state=DGG.NORMAL,
             pos=(-0.075, 0, 0.05),
             frameSize=(-0.4, 0.4, -0.5, 0.5), 
-            canvasSize=(-0.4, 0.4, canvas_bottom, 0),     
+            canvasSize=(-0.4, 0.4, -1, 0),
             frameColor=(0, 0, 0, 0.01), # Almost invisible, but catches hits
             scrollBarWidth=0.04,
             verticalScroll_frameSize=(-0.02, 0.02, -0.5, 0.5),
@@ -199,6 +209,7 @@ class GameUI:
             def wrapped(v, name=n, func=cb):
                 func(v)
                 self.base.save_setting(name, v)
+                if name == "Discord Rich Presence": self.layout_settings()
 
             btn = self.create_switch(self.scroll_frame.getCanvas(), n, 0.2, start_y - (i * step), val, wrapped)
             self.bind_scroll_events(btn)
@@ -213,9 +224,94 @@ class GameUI:
                 if val: self.inv_node.show()
                 else: self.inv_node.hide()
 
+        y = start_y - len(opts) * step
+        self.convert_button = DirectButton(parent=self.scroll_frame.getCanvas(), text='Convert legacy maps', scale=.045,
+                               pos=(-.05,0,y), command=self.base.convert_legacy_maps)
+        self.bind_scroll_events(self.convert_button)
+        self.presence_status = DirectLabel(parent=self.scroll_frame.getCanvas(),
+                    text=self.base.presence.connection_status, text_wordwrap=17,
+                    text_align=TextNode.ALeft, scale=.037, pos=(-.35,0,y-step),
+                    frameColor=(0,0,0,0), text_fg=(1,1,1,1), state=DGG.DISABLED)
+
+        self.layout_settings()
+
+    def layout_settings(self):
+        y = -.05
+        for name,(button,_,_) in self.switches.items():
+            if name.startswith('Discord Show ') and not self.base.presence.enabled:
+                button.hide()
+            else:
+                button.show(); button.setZ(y); y -= .11
+        self.convert_button.setZ(y)
+        bottom = y + self.convert_button.getBounds()[2]*self.convert_button.getSz()
+        if self.base.presence.enabled:
+            self.presence_status.show(); self.presence_status.setZ(y-.11)
+            bottom = min(bottom,self.presence_status.getZ()+self.presence_status.getBounds()[2]*self.presence_status.getSz())
+        else:
+            self.presence_status.hide()
+        # Use actual visible widget bounds instead of reserving empty text rows.
+        self.scroll_frame['canvasSize'] = (-.4,.4,bottom-.025,0)
+
+    def show_gpu_notice(self, recommendation):
+        if getattr(self.base,'gpu_notice_open',False): return
+        from disepshun.gpu_advice import executable_path
+        self.base.gpu_notice_open = True; self.base.paused = True
+        for key in self.base.keyMap: self.base.keyMap[key] = False
+        self.base.ctrl_group_tap_pending = False
+        aspect = self.base.getAspectRatio()
+        self.gpu_notice = DirectFrame(parent=self.base.aspect2d,
+            frameSize=(-aspect,aspect,-1,1),frameColor=(0,0,0,.75),
+            state=DGG.NORMAL,sortOrder=200)
+        panel = DirectFrame(parent=self.gpu_notice,frameSize=(-.9,.9,-.78,.78),
+            frameColor=(.1,.1,.1,1),state=DGG.NORMAL)
+        panel.setScale(min(1,(aspect-.05)/.95))
+        DirectLabel(parent=panel,text='Faster GPU available',scale=.07,pos=(0,0,.65),
+            frameColor=(0,0,0,0),text_fg=(1,1,1,1),state=DGG.DISABLED)
+        message = (f"Using: {recommendation['current']}\n"
+                   f"Available: {recommendation['recommended']}\n\n"
+                   "For better performance:\n"
+                   "1. Open Windows Graphics settings.\n"
+                   "2. Add a desktop app and browse to:\n"
+                   f"{executable_path()}\n"
+                   "3. Select Options > High performance,\n"
+                   "choose the GPU above, and Save.\n"
+                   "4. Restart the game to apply the change.")
+        DirectLabel(parent=panel,text=message,text_wordwrap=37,text_align=TextNode.ALeft,
+            scale=.043,pos=(-.78,0,.5),frameColor=(0,0,0,0),text_fg=(1,1,1,1),state=DGG.DISABLED)
+        self.gpu_action_status = DirectLabel(parent=panel,text='',text_wordwrap=38,
+            text_align=TextNode.ALeft,scale=.037,pos=(-.78,0,-.4),
+            frameColor=(0,0,0,0),text_fg=(.6,.9,1,1),state=DGG.DISABLED)
+        self.gpu_never_show = DirectCheckButton(parent=panel,text='Never show this again',
+            scale=.045,pos=(-.7,0,-.54),text_align=TextNode.ALeft,indicatorValue=False,
+            frameColor=(0,0,0,0),text_fg=(1,1,1,1),
+            command=lambda value:self.base.save_setting('Hide Low Power GPU Warning',bool(value)))
+        self.gpu_switch_button = DirectButton(parent=panel,text='Use better GPU',scale=.055,
+            pos=(-.36,0,-.68),command=self.open_gpu_settings)
+        self.gpu_close_button = DirectButton(parent=panel,text='Close [Esc]',scale=.055,
+            pos=(.42,0,-.68),command=self.close_gpu_notice)
+        properties = WindowProperties(); properties.setCursorHidden(False)
+        self.base.win.requestProperties(properties)
+
+    def open_gpu_settings(self):
+        from disepshun.gpu_advice import open_graphics_settings
+        opened = open_graphics_settings()
+        self.gpu_action_status['text'] = ('Graphics settings opened. Save your choice, then restart the game.'
+            if opened else 'Open Settings > System > Display > Graphics manually, then follow the steps above.')
+
+    def close_gpu_notice(self):
+        if not getattr(self.base,'gpu_notice_open',False): return
+        self.gpu_notice.destroy()
+        self.base.gpu_notice_open = False; self.base.paused = self.base.menu_open
+        for key in self.base.keyMap: self.base.keyMap[key] = False
+        self.base.ctrl_group_tap_pending = False
+        properties = WindowProperties(); properties.setCursorHidden(not self.base.menu_open)
+        self.base.win.requestProperties(properties)
+        if not self.base.menu_open: self.base.center_mouse()
+
     def create_switch(self, parent, label_text, x, y, initial_value, callback):
         btn = DirectButton(parent=parent, pos=(0, 0, y), frameSize=(-0.38, 0.38, -0.04, 0.04), frameColor=(0, 0, 0, 0), relief=DGG.FLAT)
-        DirectLabel(parent=btn, text=label_text, scale=0.05, pos=(-0.35, 0, -0.015), text_align=TextNode.ALeft, text_fg=(1, 1, 1, 1), frameColor=(0, 0, 0, 0), state=DGG.DISABLED)
+        label_scale=min(.05,.46/max(.01,TextNode('measure').calcWidth(label_text)))
+        DirectLabel(parent=btn, text=label_text, scale=label_scale, pos=(-0.35, 0, -0.015), text_align=TextNode.ALeft, text_fg=(1, 1, 1, 1), frameColor=(0, 0, 0, 0), state=DGG.DISABLED)
         
         c_on = (0.2, 0.8, 0.2, 1)
         c_off = (0.2, 0.2, 0.2, 1)
@@ -231,7 +327,7 @@ class GameUI:
             track['frameColor'] = (0.2, 0.8, 0.2, 1) if btn.is_on else (0.2, 0.2, 0.2, 1)
         def toggle():
             set_value(not btn.is_on)
-            if not btn.is_on: self.base.play_sfx("toggle", 0.85) # Before the callback, so switching Sound off still clicks
+            if not btn.is_on: self.base.play_sfx("toggle", .85) # Before the callback, so switching Sound off still clicks
             callback(btn.is_on)
             if btn.is_on: self.base.play_sfx("toggle", 1.0)
         btn.set_value = set_value
@@ -248,7 +344,10 @@ class GameUI:
             if not self.show_tool: self.tool_text.hide()
             self.fly_text.hide()
 
-    def set_menu_visible(self, v): self.menu_frame.show() if v else self.menu_frame.hide()
+    def set_menu_visible(self, v):
+        self.menu_frame.show() if v else self.menu_frame.hide()
+        if not v:
+            self.drag_stop(None)
     
     def update_selection(self, idx):
         if idx is None or idx < 0 or idx >= len(self.inv_slots):

@@ -69,8 +69,9 @@ class ParticleSystem:
         px, py, pz = pos.x, pos.y, pos.z + 0.6
         curr_t = ClockObject.getGlobalClock().getFrameTime()
         
-        # Increase size and count slightly to ensure visibility
-        for _ in range(30):
+        # A burst of placements must not create an unbounded number of nodes.
+        available = max(0, self.pool_size-len(self.active_parts))
+        for _ in range(min(30, available)):
             sx = px + rnd(-0.4, 0.4)
             sy = py + rnd(-0.4, 0.4)
             sz = pz
