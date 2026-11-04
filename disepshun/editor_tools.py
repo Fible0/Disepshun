@@ -5,13 +5,13 @@ from panda3d.core import VBase3, GeomVertexData, GeomVertexFormat, GeomVertexWri
 
 
 class EditorTools:
-    TOOL_SLOTS = (7, 8, 9, 10, 11)
-    TOOL_NAMES = {7: 'Waypoint', 8: 'Trampoline', 9: 'Checkpoint', 10: 'Grouping', 11: 'Selection'}
+    TOOL_SLOTS = (7, 8, 9, 10, 11, 12)
+    TOOL_NAMES = {7: 'Waypoint', 8: 'Trampoline', 9: 'Checkpoint', 10: 'Grouping', 11: 'Selection', 12: 'Fill'}
 
     SELECTION_COLORS = {7:(.8,.2,1,1), 8:(1,.72,.1,1), 9:(.1,.8,1,1),
-                        10:(.35,1,.2,1), 11:(1,.25,.6,1)}
+                        10:(.35,1,.2,1), 11:(1,.25,.6,1), 12:(1,.85,.35,1)}
 
-    COMBINED_TOOLS = (8, 9, 10)
+    COMBINED_TOOLS = (8, 9, 10, 12)
 
     def selecting(self):
         return self.tool_mode in self.COMBINED_TOOLS or (self.tool_mode in self.TOOL_SLOTS and self.tool_phases[self.tool_mode] == 'select')
@@ -38,7 +38,7 @@ class EditorTools:
             ref = self.selected_movers[0] if self.selected_movers else None
             waypoints = [c.getPos()+(w-ref['origin']) for w in ref['waypoints']] if ref else []
             m = self.world.convert_to_mover(c, dict(waypoints=waypoints, speed=ref['speed'] if ref else 3.0,
-                current_idx=0, wait_timer=0, origin=c.getPos(), direction=1))
+                current_idx=0, wait_timer=0, origin=c.getPos(), direction=1, loop=ref.get('loop',False) if ref else False))
             self.selected_movers.append(m)
 
     def editor_notice(self, text):
@@ -225,6 +225,7 @@ class EditorTools:
         active=self.world.active_checkpoint_cube
         self.physics.checkpoint=active.getPos(self.render)+VBase3(0,0,1) if active is not None else VBase3(0,0,1)
         self.update_hud(); self.draw_checkpoint_direction(); self.draw_selection_center()
+        if result: self.play_sfx('redo' if redo else 'undo')
         return result
 
     def commit_editor(self, sound, token=None, nodes=None, rate=None):
@@ -240,6 +241,7 @@ class EditorTools:
         if ungroup is None:
             groups={c.getTag('group') for c in self.selected_objects}
             ungroup=len(groups)==1 and '' not in groups
+        if not ungroup and len(set(self.selected_objects)) < 2: return
         token=self.begin_edit(self.selected_objects)
         group = uuid.uuid4().hex
         for c in self.selected_objects:
@@ -265,7 +267,7 @@ class EditorTools:
                 self.clipboard.append(dict(pos=VBase3(c.getPos()), mat=int(c.getTag('material')),
                     bounce=float(c.getTag('bounciness') or 1.3), max_h=float(c.getTag('max_height') or 0),
                     group=c.getTag('group'), heading=c.getTag('heading'),
-                    mover=None if m is None else dict(origin=VBase3(m['origin']), speed=m['speed'],
+                    mover=None if m is None else dict(origin=VBase3(m['origin']), speed=m['speed'], loop=m.get('loop',False),
                         waypoints=[VBase3(w) for w in m['waypoints']])))
             if command == 'copy': self.play_sfx('copy'); return
             command = 'delete'
@@ -289,7 +291,7 @@ class EditorTools:
                 m = rec['mover']
                 if m:
                     self.world.convert_to_mover(c, dict(origin=m['origin']+delta, speed=m['speed'],
-                        waypoints=[w+delta for w in m['waypoints']], current_idx=0, direction=1, wait_timer=0))
+                        waypoints=[w+delta for w in m['waypoints']], current_idx=0, direction=1, wait_timer=0, loop=m.get('loop',False)))
                 else:
                     self.world.cubes.append(c); self.world.cube_map[self.world.get_grid_key(pos)] = c
                     self.world.register_cube(c); self.world.request_chunk_update(pos)
@@ -298,12 +300,25 @@ class EditorTools:
 
     def valid_positions(self, positions, ignored):
         ignored = set(ignored)
-        others = [c.getPos() for c in self.world.all_blocks() if c not in ignored]
-        for i, p in enumerate(positions):
+        # Nearby cells suffice for unit-cube overlap; avoid comparing every
+        # selected block against the entire map and every earlier selection.
+        occupied = {}
+        for c in self.world.all_blocks():
+            if c in ignored: continue
+            q = c.getPos()
+            key = tuple(math.floor(v) for v in q)
+            occupied.setdefault(key, []).append(q)
+        for p in positions:
             if any(not math.isfinite(v) or abs(v)>self.world.COORD_LIMIT for v in p) or p.z < -19.5:
                 self.editor_notice('Objects must stay inside the map bounds'); return False
-            if any(all(abs(p[j]-q[j]) < .999 for j in range(3)) for q in others + positions[:i]):
-                self.editor_notice('Edit blocked: objects would overlap'); return False
+            x,y,z = (math.floor(v) for v in p)
+            for cx in range(x-1,x+2):
+                for cy in range(y-1,y+2):
+                    for cz in range(z-1,z+2):
+                        if any(abs(p.x-q.x)<.999 and abs(p.y-q.y)<.999 and abs(p.z-q.z)<.999
+                               for q in occupied.get((cx,cy,cz), ())):
+                            self.editor_notice('Edit blocked: objects would overlap'); return False
+            occupied.setdefault((x,y,z), []).append(p)
         return True
 
     def valid_static_grid(self, positions):
@@ -317,13 +332,15 @@ class EditorTools:
             self.editor_notice('Edit blocked: a moving path would leave the map bounds'); return False
         return True
 
-    def transform_selection(self, dx=0, dy=0, dz=0, rotate=False, to_cursor=False):
+    def transform_selection(self, dx=0, dy=0, dz=0, rotate=False, to_cursor=False, rotate_axis='z'):
         if not self.tinkering() or self.tool_mode != 11 or not self.selected_objects: return
         pivot = self.reference_point([c.getPos() for c in self.selected_objects], grid_z=any(not self.world.find_mover(c) for c in self.selected_objects))
         delta = self.preview.getPos() - pivot if to_cursor else VBase3(dx,dy,dz)
         def transform(p):
             v = p-pivot
-            return pivot + (VBase3(-v.y,v.x,v.z) if rotate else v) + delta
+            if rotate:
+                v = VBase3(v.x,-v.z,v.y) if rotate_axis=='x' else VBase3(-v.y,v.x,v.z)
+            return pivot + v + delta
         positions = [transform(c.getPos()) for c in self.selected_objects]
         if not self.valid_positions(positions, self.selected_objects): return
         if not self.valid_static_grid([p for c,p in zip(self.selected_objects, positions) if not self.world.find_mover(c)]): return
@@ -341,7 +358,7 @@ class EditorTools:
                 m['origin'] = transform(m['origin'])
                 m['waypoints'] = [transform(w) for w in m['waypoints']]
             c.setPos(p)
-            if rotate: c.setTag('heading', str((float(c.getTag('heading') or 0)+90)%360))
+            if rotate and rotate_axis=='z': c.setTag('heading', str((float(c.getTag('heading') or 0)+90)%360))
             if not m:
                 self.world.cube_map[self.world.get_grid_key(p)] = c
                 self.world.register_cube(c); self.world.request_chunk_update(p)
@@ -366,3 +383,61 @@ class EditorTools:
             self.editor_notice(f'Converted {count} maps; skipped {len(self.world.conversion_errors)} invalid maps; originals kept')
             self.play_sfx('map_convert')
         except Exception as e: self.editor_notice(f'Conversion failed: {e}')
+
+    FILL_NAMES = ('White', 'Gray', 'Hazard', 'Checkpoint', 'Trampoline', 'White / Gray checkers')
+
+    def toggle_fill_solid(self):
+        if self.input_blocked() or self.tool_mode != 12: return
+        self.fill_solid = not getattr(self, 'fill_solid', True)
+        self.play_sfx('toggle',1.12 if self.fill_solid else .88)
+        self.update_hud()
+
+    def cancel_fill(self):
+        if getattr(self, 'fill_start', None) is not None:
+            self.fill_start = None
+            self.play_block_action(False)
+            self.update_hud()
+
+    def fill_corner(self):
+        if self.input_blocked() or self.preview.getZ() < -19.5: return
+        pos = VBase3(self.preview.getPos())
+        first = getattr(self, 'fill_start', None)
+        if first is None:
+            self.fill_start = pos
+            self.play_block_action(True)
+            self.update_hud()
+            return
+        lo = [min(round(first[i] - (.5 if i == 2 else 0)), round(pos[i] - (.5 if i == 2 else 0))) for i in range(3)]
+        hi = [max(round(first[i] - (.5 if i == 2 else 0)), round(pos[i] - (.5 if i == 2 else 0))) for i in range(3)]
+        count = math.prod(hi[i] - lo[i] + 1 for i in range(3))
+        if count > 32768:
+            self.play_sfx('fill_error')
+            self.editor_notice('Fill is too large (maximum 32,768 blocks). Choose a closer second corner.')
+            return
+        token = self.begin_edit([])
+        added = []
+        movers = [m['np'].getPos() for m in self.world.moving_cubes]
+        pp = self.physics.player.getPos()
+        mode = getattr(self, 'fill_material', 1)
+        for x in range(lo[0], hi[0]+1):
+            for y in range(lo[1], hi[1]+1):
+                for z in range(lo[2], hi[2]+1):
+                    if not getattr(self, 'fill_solid', True) and not (x in (lo[0],hi[0]) or y in (lo[1],hi[1]) or z in (lo[2],hi[2])): continue
+                    p = VBase3(x, y, z+.5)
+                    key = self.world.get_grid_key(p)
+                    if key in self.world.cube_map: continue
+                    if any(all(abs(p[i]-q[i]) < .99 for i in range(3)) for q in movers): continue
+                    if abs(pp.x-x) < .9 and abs(pp.y-y) < .9 and pp.z < z+1 and pp.z+self.physics.player_height > z: continue
+                    mat = 1 + ((x+y+z) % 2) if mode == 6 else mode
+                    c = self.world._make_block(dict(pos=p, mat=mat, bounce=self.cur_bounce, max_h=self.cur_h))
+                    self.world.cubes.append(c); self.world.cube_map[key] = c
+                    self.world.register_cube(c); self.world.request_chunk_update(p)
+                    added.append(c)
+        if added:
+            self.finish_edit(token, added, 'fill')
+            self.world.queue_save()
+            self.play_block_action(True)
+        else:
+            self.play_sfx('fill_error')
+        self.fill_start = None
+        self.update_hud()

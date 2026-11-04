@@ -29,7 +29,7 @@ class Disepshun(EditorTools, ShowBase):
         self.cam.node().getLens().setFov(90)
         self.cam.node().getLens().setFar(1000)
         
-        self.settings_file = os.path.join(DATA_DIR, "settings.json")
+        self.settings_file = os.path.join(DATA_DIR, "settings.json.gz")
         self.saved_settings = {}
         self.load_settings()
         
@@ -79,12 +79,12 @@ class Disepshun(EditorTools, ShowBase):
         self.world.sky.reparentTo(self.camera)
         if self.world.saved_checkpoint_pos:
             self.physics.checkpoint = self.world.saved_checkpoint_pos + VBase3(0, 0, 1)
-            self.physics.player.setPos(self.physics.checkpoint)
+            self.physics.set_spawn_position(self.physics.checkpoint)
             ac = self.world.active_checkpoint_cube
             if ac is not None: self.physics.player.setH(float(ac.getTag("heading") or 0))
         
         self.taskMgr.add(self.update, "update")
-        self.taskMgr.add(self.update_world, "worldUpdate")
+        self.taskMgr.add(self.update_world, "worldUpdate", sort=-10)
         
         self.ui = GameUI(self)
         self.set_tool(0)
@@ -92,20 +92,32 @@ class Disepshun(EditorTools, ShowBase):
         self.center_mouse()
         self.check_startup_gpu()
 
-    BOOL_SETTINGS = ["Hide Low Power GPU Warning", "Discord Rich Presence", "Discord Show Activity", "Discord Show Block Count", "Discord Show Time", "Discord Show Icon", "Sound", "Particles", "Fly Speed Text", "Block Preview", "Preview Shading", "Visual Floor", "Use Last Selected as Pivot", "Relative Waypoints", "Shaders"]
+    DEFAULT_SETTINGS = dict.fromkeys([
+        "Crosshair", "FPS Counter", "Tool Info", "Inventory", "Sound", "Particles",
+        "Fly Speed Text", "Block Preview", "Preview Shading", "Shaders",
+        "Discord Rich Presence", "Discord Show Activity", "Discord Show Block Count",
+        "Discord Show Time", "Discord Show Icon"], True)
+    DEFAULT_SETTINGS.update(dict.fromkeys([
+        "Visual Floor", "Use Last Selected as Pivot", "GPU Notice Shown",
+        "Hide Low Power GPU Warning"], False))
+    BOOL_SETTINGS = list(DEFAULT_SETTINGS) + ["Relative Waypoints"]
 
     def load_settings(self):
+        import gzip
+        source = self.settings_file
+        legacy = source[:-3] if source.endswith('.gz') else None
+        if not os.path.exists(source) and legacy and os.path.exists(legacy): source = legacy
         try:
-            with open(self.settings_file, 'r') as f:
-                data = json.load(f)
+            with open(source, 'rb') as f: raw = f.read()
+            data = json.loads(gzip.decompress(raw) if raw.startswith(b'\x1f\x8b') else raw)
         except FileNotFoundError:
             data = {}
         except Exception as e:
-            print(f"Settings: could not read {self.settings_file} ({e}); using defaults")
+            print(f"Settings: could not read {source} ({e}); using defaults")
             data = {}
         if not isinstance(data, dict):
-            print(f"Settings: {self.settings_file} is not a JSON object; using defaults")
-            try: shutil.copy2(self.settings_file, self.settings_file + ".bad")
+            print(f"Settings: {source} is not a JSON object; using defaults")
+            try: shutil.copy2(source, source + ".bad")
             except OSError: pass
             data = {}
         for k in self.BOOL_SETTINGS:
@@ -114,17 +126,31 @@ class Disepshun(EditorTools, ShowBase):
                 del data[k]
         if 'Use Last Selected as Pivot' not in data and 'Relative Waypoints' in data:
             data['Use Last Selected as Pivot']=data['Relative Waypoints']
-        data.pop('Relative Waypoints',None)
-        data.pop('Discord Application ID',None)
-        self.saved_settings = data
+        self.saved_settings = {k:v for k,v in data.items()
+                               if k in self.DEFAULT_SETTINGS and v != self.DEFAULT_SETTINGS[k]}
+        if legacy and source == legacy:
+            if self.write_settings():
+                try: os.remove(legacy)
+                except OSError: pass
 
-    def save_setting(self, key, value):
-        self.saved_settings[key] = value
+    def write_settings(self):
+        import gzip
+        tmp = self.settings_file + '.tmp'
         try:
             os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
-            with open(self.settings_file, 'w') as f:
-                json.dump(self.saved_settings, f, indent=4)
-        except: pass
+            raw = json.dumps(self.saved_settings, separators=(',',':')).encode('utf8')
+            with open(tmp, 'wb') as f: f.write(gzip.compress(raw, mtime=0))
+            os.replace(tmp, self.settings_file)
+            return True
+        except OSError as e:
+            print(f"Settings: could not save {self.settings_file} ({e})")
+            return False
+
+    def save_setting(self, key, value):
+        if key not in self.DEFAULT_SETTINGS: return
+        if value == self.DEFAULT_SETTINGS[key]: self.saved_settings.pop(key, None)
+        else: self.saved_settings[key] = value
+        self.write_settings()
 
     def set_x11_icon(self):
         # Panda3D's X11 window ignores icon-filename, so set _NET_WM_ICON directly
@@ -216,33 +242,46 @@ class Disepshun(EditorTools, ShowBase):
         self.picker = self.camera.attachNewNode(n); self.cTrav.addCollider(self.picker, self.cHandler)
 
     def setup_input(self):
-        map_key = lambda k, v: self.accept(k, self.update_k, [v, True]) or self.accept(k+"-up", self.update_k, [v, False])
+        def bind_action(event, callback, args=None):
+            self.accept(event, callback, [] if args is None else args)
+            # Panda prefixes ordinary button events with Shift while crouching.
+            if event.startswith('control-'):
+                for prefix in ('control-shift-','shift-control-'):
+                    self.accept(prefix+event[len('control-'):], callback, [] if args is None else args)
+            else:
+                self.accept('shift-'+event, callback, [] if args is None else args)
+        def map_key(key, value):
+            bind_action(key, self.update_k, [value, True])
+            bind_action(key+'-up', self.update_k, [value, False])
         for k in ["w","s","a","d","space","lshift","rshift","lcontrol","rcontrol","z","x"]: map_key("raw-"+k, k)
         for k in ["mouse1","mouse3"]: map_key(k, k)
         map_key("raw-minus", "minus"); map_key("raw-equal", "plus"); map_key("-", "minus"); map_key("=", "plus")
         map_key("raw-[", "br_l"); map_key("raw-]", "br_r")
         
-        for i in range(1, 6): self.accept(str(i), self.handle_slot, [i])
-        self.accept("q", self.toggle_hotbar)
-        self.accept("tab", self.toggle_tool_phase)
+        for i in range(1, 7): bind_action(str(i), self.handle_slot, [i])
+        bind_action("q", self.toggle_hotbar)
+        bind_action("tab", self.toggle_tool_phase)
+        bind_action("h", self.toggle_fill_solid)
+        bind_action("l", self.toggle_mover_loop)
         
-        self.accept("wheel_up", self.adj_dist, [1]); self.accept("wheel_down", self.adj_dist, [-1])
-        self.accept("r", self.undo_wp); self.accept("f", self.toggle_fly); self.accept("g", self.toggle_god); self.accept("escape", self.toggle_menu)
+        bind_action("wheel_up", self.adj_dist, [1]); bind_action("wheel_down", self.adj_dist, [-1])
+        bind_action("f", self.toggle_fly); bind_action("g", self.toggle_god); bind_action("escape", self.toggle_menu)
         for key,cmd in [('control-c','copy'),('control-x','cut'),('control-v','paste'),('control-a','all'),('control-d','clear')]:
-            self.accept(key,self.left_ctrl_shortcut,[self.selection_command,cmd])
-        self.accept('delete',self.selection_command,['delete'])
-        self.accept('control-z',self.left_ctrl_shortcut,[self.history_step])
-        self.accept('control-y',self.left_ctrl_shortcut,[self.history_step,True])
+            bind_action(key,self.left_ctrl_shortcut,[self.selection_command,cmd])
+        bind_action('delete',self.selection_command,['delete'])
+        bind_action('control-z',self.left_ctrl_shortcut,[self.history_step])
+        bind_action('control-y',self.left_ctrl_shortcut,[self.history_step,True])
         events={'editor-button-down'}
         for thrower in (getattr(self,'buttonThrowers',None) or []):
             event=thrower.node().getButtonDownEvent()
             if not event: event='editor-button-down'; thrower.node().setButtonDownEvent(event)
             events.add(event)
-        for event in events: self.accept(event,self.note_control_chord)
+        for event in events: bind_action(event,self.note_control_chord)
         for key, delta in [('arrow_left',(-1,0,0)), ('arrow_right',(1,0,0)), ('arrow_up',(0,1,0)), ('arrow_down',(0,-1,0)), ('page_up',(0,0,1)), ('page_down',(0,0,-1))]:
-            self.accept(key, self.transform_selection, list(delta))
-        self.accept('e', self.transform_selection, [0,0,0,True])
-        self.accept('enter', self.checkpoint_face_camera)
+            bind_action(key, self.transform_selection, list(delta))
+        bind_action('e', self.transform_selection, [0,0,0,True])
+        bind_action('t', self.transform_selection, [0,0,0,True,False,'x'])
+        bind_action('enter', self.checkpoint_face_camera)
         self.disableMouse()
 
     def note_control_chord(self, button):
@@ -292,12 +331,13 @@ class Disepshun(EditorTools, ShowBase):
         if not self.menu_open: self.center_mouse()
 
     def check_startup_gpu(self):
-        if self.saved_settings.get('Hide Low Power GPU Warning',False): return
+        if self.saved_settings.get('GPU Notice Shown',False): return
         gsg = self.win.getGsg()
         if gsg is None: return
-        from disepshun.gpu_advice import check_renderer
-        recommendation = check_renderer(gsg.getDriverRenderer())
-        if recommendation is not None: self.ui.show_gpu_notice(recommendation)
+        from disepshun.gpu_advice import renderer_info
+        info = renderer_info(gsg.getDriverRenderer())
+        self.ui.show_gpu_notice(info)
+        self.save_setting('GPU Notice Shown', True)
 
     def toggle_fly(self):
         if self.input_blocked(): return
@@ -336,7 +376,7 @@ class Disepshun(EditorTools, ShowBase):
 
     def toggle_preview_shading(self, v):
         self.preview_shading = v
-        if v:
+        if v and self.tool_mode not in self.TOOL_SLOTS:
             self.preview.clearLight()
             self.preview.setLightOff(0)
             self.preview.setLight(self.world.dlnp)
@@ -359,8 +399,11 @@ class Disepshun(EditorTools, ShowBase):
             volume *= random.uniform(.94,1.0)
         s.stop(); s.setPlayRate(rate); s.setVolume(volume); s.play()
 
-    def play_adjustment(self, name, direction):
-        self.play_sfx(name,1.12 if direction>0 else .88)
+    def play_block_action(self, right_click):
+        self.play_sfx('place' if right_click else 'break', random.uniform(.95,1.05))
+
+    def play_adjustment(self, direction):
+        self.play_sfx('checkpoint_turn',1.12 if direction>0 else .88)
 
     def toggle_particles(self, v): 
         self.particles_enabled = v
@@ -376,25 +419,28 @@ class Disepshun(EditorTools, ShowBase):
         if self.input_blocked(): return
         self.hotbar_page = 1 - self.hotbar_page
         self.ui.update_hotbar_layout(self.hotbar_page)
-        self.set_tool(0) # Deselect current tool when switching context
+        self.set_tool(0, play_sound=False) # Deselect when switching context
+        self.play_sfx('hotbar_tools' if self.hotbar_page else 'hotbar_blocks')
 
     def handle_slot(self, i):
         if self.input_blocked(): return
         if self.hotbar_page == 0:
+            if i > 5: return
             self.set_tool(i)
         elif self.hotbar_page == 1:
             # Tool slots are independent from block material IDs.
             self.set_tool(self.TOOL_SLOTS[i-1])
 
-    def set_tool(self, m):
+    def set_tool(self, m, play_sound=True):
         if self.tool_mode == m: m = 0
         self.tool_mode = m
+        self.fill_start = None
         self.selected_objects = []
         self.refresh_object_selection()
         self.deselect_movers(); self.deselect_trampolines()
         self.build_material = m if 1 <= m <= 5 else 0
         self.preview.hide()
-        self.play_sfx('tool_equip' if m else 'tool_unequip')
+        if play_sound: self.play_sfx('tool_equip' if m else 'tool_unequip')
         self.update_hud()
 
         # Color mapping for preview
@@ -410,13 +456,8 @@ class Disepshun(EditorTools, ShowBase):
         self.preview.setTransparency(TransparencyAttrib.MAlpha)
         self.preview.setAlphaScale(0.5)
         
-        # Unshaded preview for Movement Tool (7)
-        if m == 7:
-            self.preview.setLightOff(1)
-            self.preview.clearShader()
-        else:
-            # Respect setting for other blocks
-            self.toggle_preview_shading(self.preview_shading)
+        # All tools share the Waypoint preview; block previews follow the setting.
+        self.toggle_preview_shading(self.preview_shading)
 
         v_idx = -1
         if self.hotbar_page == 0:
@@ -437,6 +478,9 @@ class Disepshun(EditorTools, ShowBase):
     
     def adj_val(self, d):
         if not self.tinkering(): return
+        if self.tool_mode==12:
+            self.fill_material = (getattr(self, 'fill_material', 1)-1+d) % 6+1
+            self.play_sfx('toggle', 1.12 if d > 0 else .88); self.update_hud(); return
         if self.tool_mode==9: return self.adjust_checkpoint(d)
         if self.tool_mode==7:
             nodes=self.selected_objects or [m['np'] for m in self.selected_movers]
@@ -444,13 +488,13 @@ class Disepshun(EditorTools, ShowBase):
             token=self.begin_edit(nodes); self.ensure_selected_movers()
             for m in self.selected_movers: m['speed']=min(1000.0,max(.5,round(m['speed']+d*.5,1)))
             self.finish_edit(token,[m['np'] for m in self.selected_movers],'mover_speed')
-            self.update_hud(); self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment('mover_speed',d)
+            self.update_hud(); self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment(d)
         elif self.tool_mode==8 and self.selected_trampolines:
             token=self.begin_edit(self.selected_trampolines)
             self.cur_bounce=min(100,max(.1,round(self.cur_bounce+d*.1,1)))
             for t in self.selected_trampolines: t.setTag('bounciness',str(self.cur_bounce))
             self.finish_edit(token,self.selected_trampolines,'trampoline_bounce')
-            self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment('trampoline_bounce',d); self.update_hud()
+            self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment(d); self.update_hud()
 
     def adj_h(self, d):
         if not self.tinkering(): return
@@ -459,12 +503,12 @@ class Disepshun(EditorTools, ShowBase):
             self.cur_h=min(10000,max(0,round(self.cur_h+d*.5,1)))
             for t in self.selected_trampolines: t.setTag('max_height',str(self.cur_h))
             self.finish_edit(token,self.selected_trampolines,'trampoline_height')
-            self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment('trampoline_height',d); self.update_hud()
+            self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment(d); self.update_hud()
 
     def adj_fly(self, d):
         previous = self.physics.fly_speed
         self.physics.fly_speed = max(1.0, round(previous + d, 1))
-        if self.physics.fly_speed != previous: self.play_adjustment('flight_speed',self.physics.fly_speed-previous)
+        if self.physics.fly_speed != previous: self.play_adjustment(self.physics.fly_speed-previous)
         if not self.ui.gui_hidden and self.fly_text_enabled:
             self.ui.fly_text.setText(f"Fly Speed: {self.ui.format_number(self.physics.fly_speed)}"); self.ui.fly_text.show(); self.ui.fly_text.setAlphaScale(1.0); self.fly_text_timer = 3.0
 
@@ -485,7 +529,7 @@ class Disepshun(EditorTools, ShowBase):
             off = pos - ref
             for m in self.selected_movers: m['waypoints'].append(m['origin'] + off)
             self.finish_edit(token,[m['np'] for m in self.selected_movers],'waypoint_add')
-            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map(); self.play_sfx("waypoint_add")
+            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map(); self.play_block_action(True)
 
     def deselect_movers(self):
         for m in self.selected_movers: m['np'].clearColorScale()
@@ -499,13 +543,28 @@ class Disepshun(EditorTools, ShowBase):
 
     def undo_wp(self):
         if not self.tinkering(): return
-        if self.tool_mode == 7 and self.selected_movers:
+        if self.tool_mode == 7 and any(m['waypoints'] for m in self.selected_movers):
             token=self.begin_edit([m['np'] for m in self.selected_movers])
             for m in self.selected_movers:
                 if m['waypoints']: 
                     m['waypoints'].pop()
             self.finish_edit(token,[m['np'] for m in self.selected_movers],'waypoint_remove')
-            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map(); self.play_sfx("waypoint_remove")
+            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map(); self.play_block_action(False)
+
+    def toggle_mover_loop(self):
+        if self.tool_mode != 7 or not self.tinkering(): return
+        nodes = self.selected_objects or [m['np'] for m in self.selected_movers]
+        if not nodes: return
+        token = self.begin_edit(nodes)
+        self.ensure_selected_movers()
+        loop = not all(m.get('loop', False) for m in self.selected_movers)
+        for m in self.selected_movers:
+            m['loop'] = loop
+            m['direction'] = 1
+        self.finish_edit(token, [m['np'] for m in self.selected_movers], 'waypoint_loop')
+        self.play_sfx('toggle',1.12 if loop else .88)
+        self.world.map_is_dirty = True; self.world.save_map()
+        self.draw_wp(); self.update_hud()
 
     def draw_wp(self):
         if self.wp_node: self.wp_node.removeNode(); self.wp_node = None
@@ -519,7 +578,7 @@ class Disepshun(EditorTools, ShowBase):
             if len(pts) > 1:
                 ls.moveTo(pts[0])
                 for p in pts[1:]: ls.drawTo(p)
-                if len(pts) > 2: ls.drawTo(pts[0])
+                if mc.get('loop', False) and len(pts) > 2: ls.drawTo(pts[0])
             for p in pts:
                 np = self.render.attachNewNode(mg); np.setPos(p); np.setBillboardPointEye(); np.setColor(1,0,1,1); np.setDepthTest(False); np.setBin("fixed", 1); self.wp_markers.append(np)
         self.wp_node = self.render.attachNewNode(ls.create()); self.wp_node.setDepthTest(False); self.wp_node.setBin("fixed", 1)
@@ -527,6 +586,12 @@ class Disepshun(EditorTools, ShowBase):
     def update_hud(self):
         if self.tool_mode not in self.TOOL_SLOTS:
             self.ui.tool_text.setText(''); return
+        if self.tool_mode == 12:
+            first = getattr(self, 'fill_start', None)
+            corner = 'Choose first corner' if first is None else f'First: {tuple(first)} | Choose second corner'
+            self.ui.tool_text.setFg(self.SELECTION_COLORS[12])
+            self.ui.tool_text.setText(f"FILL TOOL\n{self.FILL_NAMES[getattr(self, 'fill_material', 1)-1]} [-/+]\n{'Solid' if getattr(self, 'fill_solid', True) else 'Hollow'} [H]\n{corner}\n[R-Click] Set corner / Fill | [L-Click] Cancel\nOccupied blocks and player space are skipped")
+            return
         fmt = self.ui.format_number
         combined = self.tool_mode in self.COMBINED_TOOLS
         phase = self.tool_phases[self.tool_mode]
@@ -540,7 +605,8 @@ class Disepshun(EditorTools, ShowBase):
             body += '\n[Tab] Tinker with selection'
         elif self.tool_mode == 7:
             speed = self.selected_movers[-1]['speed'] if self.selected_movers else 3.0
-            body = f'Speed: {fmt(speed)} [-/+]\n[R-Click] Add waypoint | [R] Undo waypoint'
+            mode = 'Loop' if self.selected_movers and all(m.get('loop',False) for m in self.selected_movers) else 'Back and forth'
+            body = f'Speed: {fmt(speed)} [-/+]\nPath: {mode} [L]\n[R-Click] Add waypoint | [L-Click] Delete last waypoint'
         elif self.tool_mode == 8:
             body = f'[L-Click] Select / deselect\nBounce: {fmt(self.cur_bounce)} [-/+]\nMax H: {fmt(self.cur_h)} [Z/X]'
         elif self.tool_mode == 9:
@@ -550,7 +616,7 @@ class Disepshun(EditorTools, ShowBase):
             body = '[L-Click] Select / deselect\n[LCtrl] Group / Ungroup'
         else:
             body = ('[R-Click] Move here | [Arrows / PgUp/PgDn] Move\n'
-                    '[E] Rotate | [Delete] Delete\n[LCtrl+C/X/V] Copy / Cut / Paste')
+                    '[E] Rotate horizontally | [T] Rotate vertically | [Delete] Delete\n[LCtrl+C/X/V] Copy / Cut / Paste')
         if self.tool_mode==11: body+='\nCyan point: center / pivot'
         self.ui.tool_text.setText(header + body)
 
@@ -579,7 +645,10 @@ class Disepshun(EditorTools, ShowBase):
         dt = globalClock.getDt(); t = globalClock.getFrameTime()
         self.ui.update_item_name(dt)
         self.ui.update_presence_status()
-        self.ui.fps_text.setText(f"FPS: {round(globalClock.getAverageFrameRate())}")
+        fps = round(globalClock.getAverageFrameRate())
+        if fps != getattr(self, '_last_fps', None):
+            self.ui.fps_text.setText(f"FPS: {fps}")
+            self._last_fps = fps
         
         if self.fly_text_timer > 0 and not self.paused:
             self.fly_text_timer -= dt
@@ -617,18 +686,18 @@ class Disepshun(EditorTools, ShowBase):
         self.physics.update(dt, self.keyMap)
         if not self.physics.god_mode and self.physics.player.getZ() < -20: self.physics.respawn()
 
-        if ((self.tool_mode in (7, 11) and self.tinkering()) or self.build_material != 0):
+        if ((self.tool_mode in (7, 11, 12) and self.tinkering()) or self.build_material != 0):
             self.cTrav.traverse(self.render)
             pl = VBase3(); ok = False
             if self.cHandler.getNumEntries() > 0:
                 self.cHandler.sortEntries(); e = self.cHandler.getEntry(0); hp = e.getSurfacePoint(self.render)
                 if (hp - self.camera.getPos(self.render)).length() <= self.build_dist:
                     p = e.getIntoNodePath().getParent()
-                    if p.getName().startswith("chunk_") or p in self.world.cubes or p.hasTag("material") or any(mc['np'] == p for mc in self.world.moving_cubes):
+                    if p.hasTag("material") or p == self.world.god_collision_floor or p.getName().startswith("chunk_") or p in self.world.cubes or any(mc['np'] == p for mc in self.world.moving_cubes):
                         if p == self.world.god_collision_floor: pl.set(round(hp.x), round(hp.y), -19.5)
                         else:
                             n = e.getSurfaceNormal(self.render)
-                            if p in self.world.cubes or p.hasTag("material"):
+                            if p.hasTag("material") or p in self.world.cubes:
                                 cp = p.getPos(self.render)
                             elif any(mc['np'] == p for mc in self.world.moving_cubes):
                                 cp = p.getPos(self.render)
@@ -674,33 +743,37 @@ class Disepshun(EditorTools, ShowBase):
         carry = None; carry_top = -float('inf'); moved = {}
         pp = self.physics.player.getPos()
         for m in self.world.moving_cubes:
-            pts = [m['origin']] + m['waypoints']
+            pts, circuit = self.world.mover_path(m)
             if not pts: continue
             
-            m['current_idx'] = m['current_idx'] % len(pts)
-            tgt = pts[m['current_idx']]
-            curr = m['np'].getPos(); d = (tgt - curr).length(); s = m['speed'] * dt
+            m['current_idx'] %= len(pts)
+            curr = m['np'].getPos()
 
-            # Support is decided from the platform's position before it moves
-            if not self.physics.flying and abs(pp.x - curr.x) < 0.8 and abs(pp.y - curr.y) < 0.8 and curr.z + 0.45 <= pp.z <= curr.z + 0.6 and curr.z > carry_top:
+            # Decide support before movement, then carry before player physics runs.
+            if not self.physics.flying and self.physics.vz <= 0 and abs(pp.x - curr.x) < 0.7 and abs(pp.y - curr.y) < 0.7 and curr.z + 0.45 <= pp.z <= curr.z + 0.6 and curr.z > carry_top:
                 carry = m; carry_top = curr.z
-            
-            if d <= s:
-                m['np'].setPos(tgt)
-                if len(pts) > 1:
-                    di = m.get('direction', 1)
-                    nxt = m['current_idx'] + di
-                    if nxt >= len(pts):
-                        m['direction'] = -1
-                        nxt = len(pts) - 2
-                    elif nxt < 0:
-                        m['direction'] = 1
-                        nxt = 1
-                    m['current_idx'] = nxt
+
+            remaining = m['speed'] * min(dt, .1)
+            pos = VBase3(curr)
+            # Remove complete circuits to keep large steps and duplicate points bounded.
+            if circuit > 0: remaining %= circuit
+            for _ in range(2*len(pts)+1):
+                tgt = pts[m['current_idx']]
+                delta = tgt-pos; distance = delta.length()
+                if distance > remaining:
+                    pos += delta * (remaining/distance)
+                    break
+                pos = VBase3(tgt); remaining -= distance
+                if len(pts) == 1: break
+                if m.get('loop',False):
+                    m['current_idx'] = (m['current_idx']+1) % len(pts)
                 else:
-                     m['current_idx'] = 0
-            else: 
-                m['np'].setPos(curr + (tgt - curr) / d * s)
+                    nxt = m['current_idx'] + m.get('direction',1)
+                    if nxt >= len(pts): m['direction'] = -1; nxt = len(pts)-2
+                    elif nxt < 0: m['direction'] = 1; nxt = 1
+                    m['current_idx'] = nxt
+                if remaining <= 0: break
+            m['np'].setPos(pos)
             moved[id(m)] = m['np'].getPos() - curr
 
         if carry is not None:
@@ -714,6 +787,7 @@ class Disepshun(EditorTools, ShowBase):
 
     def place(self):
         if self.input_blocked(): return
+        if self.tool_mode == 12: return self.fill_corner()
         if self.tool_mode == 11: return self.transform_selection(to_cursor=True)
         if self.tool_mode == 10: return
         if self.tool_mode in (8, 9): return
@@ -752,14 +826,14 @@ class Disepshun(EditorTools, ShowBase):
             no = mc['origin'] + off
             c.setPos(mp + off)
             nw = [no + (w - mc['origin']) for w in mc['waypoints']]
-            self.world.convert_to_mover(c, {'waypoints': nw, 'speed': mc['speed'], 'current_idx': mc['current_idx'], 'wait_timer': 0, 'origin': no, 'direction': mc.get('direction', 1)})
+            self.world.convert_to_mover(c, {'waypoints': nw, 'speed': mc['speed'], 'current_idx': mc['current_idx'], 'wait_timer': 0, 'origin': no, 'direction': mc.get('direction', 1), 'loop': mc.get('loop', False)})
         else:
             self.world.cubes.append(c); self.world.cube_map[k] = c
             self.world.register_cube(c)
             self.world.request_chunk_update(pos)
         self.finish_edit(token,[c],'place')
         self.world.queue_save()
-        self.play_sfx("place", random.uniform(0.95, 1.05))
+        self.play_block_action(True)
 
         pos = c.getPos(); pp = self.physics.player.getPos()
         if abs(pp.x - pos.x) < 0.9 and abs(pp.y - pos.y) < 0.9 and pp.z < pos.z + 0.5 and pp.z + self.physics.player_height > pos.z - 0.5:
@@ -767,7 +841,10 @@ class Disepshun(EditorTools, ShowBase):
 
     def delete(self):
         if self.input_blocked(): return
-        if self.tool_mode == 7: return self.handle_sel(7)
+        if self.tool_mode == 12:
+            self.cancel_fill(); return
+        if self.tool_mode == 7:
+            return self.undo_wp() if self.tinkering() else self.handle_sel(7)
         elif self.tool_mode in (8, 9, 10, 11): return self.select_object()
         self.cTrav.traverse(self.render)
         if self.cHandler.getNumEntries() > 0:
@@ -784,7 +861,7 @@ class Disepshun(EditorTools, ShowBase):
 
             if self.delete_objects([target]):
                 self.world.map_is_dirty=True; self.world.save_map()
-                self.play_sfx('break',random.uniform(.95,1.05))
+                self.play_block_action(False)
 
 try:
     app = Disepshun()

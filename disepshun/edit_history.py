@@ -30,7 +30,7 @@ class EditHistory:
                 state['motion'] = dict(origin=tuple(motion['origin']),
                     waypoints=tuple(tuple(p) for p in motion['waypoints']), speed=motion['speed'],
                     current_idx=motion['current_idx'], direction=motion.get('direction', 1),
-                    wait_timer=motion.get('wait_timer', 0))
+                    wait_timer=motion.get('wait_timer', 0), loop=motion.get('loop',False))
             result[self.identity(node)] = state
         return result
 

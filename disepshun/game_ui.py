@@ -42,7 +42,7 @@ class GameUI:
         self.slot_orig_x = []
         
         # Create 5 slots for the hotbar
-        for i in range(5):
+        for i in range(6):
             x = -0.2 + i*0.1
             self.slot_orig_x.append(x)
             slot, card = self.create_inv_slot(i+1, (1,1,1,1), x)
@@ -77,8 +77,10 @@ class GameUI:
 
     def update_hotbar_layout(self, page):
         colors = ([(1,1,1,1), (.4,.4,.4,1), (1,0,0,1), (0,1,0,1), (0,0,1,1)]
-                  if page == 0 else [(1,0,1,1), (0,.3,1,1), (0,1,.4,1), (1,.65,0,1), (0,1,1,1)])
+                  if page == 0 else [(1,0,1,1), (0,.3,1,1), (0,1,.4,1), (1,.65,0,1), (0,1,1,1), (1,.85,.35,1)])
         for i, slot in enumerate(self.inv_slots):
+            if i >= len(colors):
+                slot.hide(); continue
             slot.show(); slot.setX(self.slot_orig_x[i])
             self.inv_cards[i].setColor(colors[i])
 
@@ -255,6 +257,7 @@ class GameUI:
     def show_gpu_notice(self, recommendation):
         if getattr(self.base,'gpu_notice_open',False): return
         from disepshun.gpu_advice import executable_path
+        self.base.play_sfx('menu_open')
         self.base.gpu_notice_open = True; self.base.paused = True
         for key in self.base.keyMap: self.base.keyMap[key] = False
         self.base.ctrl_group_tap_pending = False
@@ -265,27 +268,33 @@ class GameUI:
         panel = DirectFrame(parent=self.gpu_notice,frameSize=(-.9,.9,-.78,.78),
             frameColor=(.1,.1,.1,1),state=DGG.NORMAL)
         panel.setScale(min(1,(aspect-.05)/.95))
-        DirectLabel(parent=panel,text='Faster GPU available',scale=.07,pos=(0,0,.65),
+        DirectLabel(parent=panel,text='Your graphics processors',scale=.07,pos=(0,0,.65),
             frameColor=(0,0,0,0),text_fg=(1,1,1,1),state=DGG.DISABLED)
-        message = (f"Using: {recommendation['current']}\n"
-                   f"Available: {recommendation['recommended']}\n\n"
-                   "For better performance:\n"
-                   "1. Open Windows Graphics settings.\n"
+        others = '\n'.join(recommendation['others']) or ('None detected' if recommendation['enumerated'] else 'Could not enumerate other GPUs')
+        message = ("Python can sometimes be set to use the less powerful GPU.\n"
+                   "Check the GPU below to make sure the game uses the one you want.\n\n"
+                   f"Currently using: {recommendation['current']}\n"
+                   f"Other GPUs:\n{others}\n\n"
+                   "To change the GPU in Windows:\n"
+                   "1. Settings > System > Display > Graphics.\n"
                    "2. Add a desktop app and browse to:\n"
                    f"{executable_path()}\n"
-                   "3. Select Options > High performance,\n"
-                   "choose the GPU above, and Save.\n"
-                   "4. Restart the game to apply the change.")
-        DirectLabel(parent=panel,text=message,text_wordwrap=37,text_align=TextNode.ALeft,
-            scale=.043,pos=(-.78,0,.5),frameColor=(0,0,0,0),text_fg=(1,1,1,1),state=DGG.DISABLED)
+                   "3. Select the app > Options, choose a GPU\n"
+                   "or High performance, then Save.\n"
+                   "4. Restart the game to apply the change.\n\n"
+                   "This notice is shown only once.")
+        from direct.gui.DirectGui import DirectScrolledFrame
+        import textwrap
+        rows = sum(max(1,len(textwrap.wrap(line, 35))) for line in message.split('\n'))
+        scroll = DirectScrolledFrame(parent=panel,frameSize=(-.81,.81,-.9,0),
+            canvasSize=(-.76,.76,-max(.9,rows*.06+.12),0),
+            pos=(0,0,.52),frameColor=(0,0,0,0),scrollBarWidth=.035)
+        DirectLabel(parent=scroll.getCanvas(),text=message,text_wordwrap=35,text_align=TextNode.ALeft,
+            scale=.043,pos=(-.75,0,-.05),frameColor=(0,0,0,0),text_fg=(1,1,1,1),state=DGG.DISABLED)
         self.gpu_action_status = DirectLabel(parent=panel,text='',text_wordwrap=38,
             text_align=TextNode.ALeft,scale=.037,pos=(-.78,0,-.4),
             frameColor=(0,0,0,0),text_fg=(.6,.9,1,1),state=DGG.DISABLED)
-        self.gpu_never_show = DirectCheckButton(parent=panel,text='Never show this again',
-            scale=.045,pos=(-.7,0,-.54),text_align=TextNode.ALeft,indicatorValue=False,
-            frameColor=(0,0,0,0),text_fg=(1,1,1,1),
-            command=lambda value:self.base.save_setting('Hide Low Power GPU Warning',bool(value)))
-        self.gpu_switch_button = DirectButton(parent=panel,text='Use better GPU',scale=.055,
+        self.gpu_switch_button = DirectButton(parent=panel,text='Graphics settings',scale=.055,
             pos=(-.36,0,-.68),command=self.open_gpu_settings)
         self.gpu_close_button = DirectButton(parent=panel,text='Close [Esc]',scale=.055,
             pos=(.42,0,-.68),command=self.close_gpu_notice)
@@ -300,6 +309,7 @@ class GameUI:
 
     def close_gpu_notice(self):
         if not getattr(self.base,'gpu_notice_open',False): return
+        self.base.play_sfx('menu_close')
         self.gpu_notice.destroy()
         self.base.gpu_notice_open = False; self.base.paused = self.base.menu_open
         for key in self.base.keyMap: self.base.keyMap[key] = False

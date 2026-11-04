@@ -38,7 +38,10 @@ class WorldManager:
         self.collision_chunks = {}
         self.chunk_format = GeomVertexFormat.getV3n3t2()
         self.chunk_contents = defaultdict(list) 
+        self.static_cube_order = {}
+        self.next_cube_order = 0
         self.dirty_chunks = set()
+        self.god_floor_enabled = False
         
         cm = CardMaker('face')
         # Standard frame: (-0.5, 0.5) creates a card in XZ plane with normal (0, -1, 0)
@@ -99,12 +102,23 @@ class WorldManager:
         if now >= self.next_glow_scan:
             self.next_glow_scan = now+.2
             nearby=[]
-            for c in self.all_blocks():
+            # Only nearby static chunks can contribute within the 15-unit radius.
+            # Preserve map order for equal distances, including static/mover ties.
+            radius = 15
+            cs = self.chunk_size
+            for x in range(math.floor((camera_pos.x-radius-1)/cs), math.floor((camera_pos.x+radius+1)/cs)+1):
+                for y in range(math.floor((camera_pos.y-radius-1)/cs), math.floor((camera_pos.y+radius+1)/cs)+1):
+                    for c in self.chunk_contents.get((x,y), ()):
+                        if c.getTag('material') not in ('3','4'): continue
+                        d=(c.getPos(self.render)-camera_pos).lengthSquared()
+                        if d < 225: nearby.append((d,self.static_cube_order[c],c))
+            for i,m in enumerate(self.moving_cubes):
+                c=m['np']
                 if c.getTag('material') not in ('3','4'): continue
                 d=(c.getPos(self.render)-camera_pos).lengthSquared()
-                if d < 225: nearby.append((d,c))
-            nearby.sort(key=lambda item:item[0])
-            self.glow_sources=[c for _,c in nearby[:len(self.glow_lights)]]
+                if d < 225: nearby.append((d,self.next_cube_order+i,c))
+            nearby.sort(key=lambda item:(item[0],item[1]))
+            self.glow_sources=[c for _,_,c in nearby[:len(self.glow_lights)]]
         for i,(light,node) in enumerate(self.glow_lights):
             c=self.glow_sources[i] if i<len(self.glow_sources) else None
             if c is None or c.isEmpty() or c.getParent().isEmpty() or c.getTag('material') not in ('3','4'):
@@ -188,14 +202,17 @@ class WorldManager:
         for c in self.chunk_contents.get(key, ()):
             if c.isHidden(): continue
             pos=c.getPos(); x,y,z=self.get_grid_key(pos)
-            color=tuple(c.getColor()); scale=tuple(c.getColorScale())
-            tint=c.getPythonTag('selection_color') if c.hasPythonTag('selection_color') else None
-            appearance=(c.getTag('material'),color,scale,c==self.active_checkpoint_cube,tint)
+            appearance=None
             visible=0
             for normal,corners in self.FACE_DATA:
                 nx,ny,nz=normal
                 neighbor=self.cube_map.get((x+nx,y+ny,z+nz))
                 if neighbor is not None and not neighbor.isHidden(): continue
+                # Interior blocks need no material/selection state or vertex data.
+                if appearance is None:
+                    color=tuple(c.getColor()); scale=tuple(c.getColorScale())
+                    tint=c.getPythonTag('selection_color') if c.hasPythonTag('selection_color') else None
+                    appearance=(c.getTag('material'),color,scale,c==self.active_checkpoint_cube,tint)
                 if appearance not in batches: batches[appearance]=(array('f'),array('I'),c)
                 vertices,indices,_=batches[appearance]; first=len(vertices)//8
                 for (dx,dy,dz),(u,v) in zip(corners,((0,0),(1,0),(1,1),(0,1))):
@@ -220,6 +237,9 @@ class WorldManager:
     def register_cube(self, cube):
         key=self.get_chunk_key(cube.getPos())
         self.chunk_contents[key].append(cube)
+        if cube not in self.static_cube_order:
+            self.static_cube_order[cube] = self.next_cube_order
+            self.next_cube_order += 1
         # Spatial bounds let the picking ray skip whole regions of colliders.
         if key not in self.collision_chunks:
             self.collision_chunks[key]=self.platform_holder.attachNewNode(f'chunk_colliders_{key}')
@@ -261,6 +281,7 @@ class WorldManager:
     def recycle_cube(self, cube):
         if cube.isEmpty(): return
         self.unregister_cube(cube)
+        self.static_cube_order.pop(cube, None)
         cube.detachNode()
         self.cube_pool.append(cube)
 
@@ -313,6 +334,20 @@ class WorldManager:
             if mc['np'] == np: return mc
         return None
 
+    @staticmethod
+    def mover_path(m):
+        """Reuse path geometry until an editor operation changes it."""
+        cached = m.get('_path_cache')
+        waypoints = m['waypoints']; loop = m.get('loop', False)
+        if (cached is None or cached[0] != m['origin'] or cached[1] is not waypoints
+                or cached[2] != len(waypoints) or cached[3] != loop):
+            pts = [m['origin']] + waypoints
+            length = sum((b-a).length() for a,b in zip(pts,pts[1:]))
+            circuit = length + (pts[-1]-pts[0]).length() if loop else 2*length
+            cached = (VBase3(m['origin']), waypoints, len(waypoints), loop, pts, circuit)
+            m['_path_cache'] = cached
+        return cached[4], cached[5]
+
     def update_cube_faces(self, cube):
         if self.find_mover(cube):
             geom = cube.find("face_geom")
@@ -335,6 +370,7 @@ class WorldManager:
         if self.cube_map.get(k) == c: del self.cube_map[k]
         if c in self.cubes: self.cubes.remove(c)
         self.unregister_cube(c)
+        self.static_cube_order.pop(c, None)
         self.request_chunk_update(c.getPos())
         if c.isStashed(): c.unstash()
         if c.getParent() != self.platform_holder: c.reparentTo(self.platform_holder)
@@ -364,10 +400,13 @@ class WorldManager:
     def create_platform(self):
         self.platform_holder = self.render.attachNewNode("PlatformHolder")
         self.chunk_contents.clear()
+        self.static_cube_order.clear()
+        self.next_cube_order = 0
         self.chunks_visual.clear()
         self.collision_chunks.clear()
         
         self.cubes = []; self.cube_map = {}; self.moving_cubes = []
+        self.god_floor_enabled = False
         
         self.update_chunks()
 
@@ -413,7 +452,8 @@ class WorldManager:
                 buf.append(l + "\n")
         for m in movers:
             c = m['np']; p = m['origin']
-            l = f"M,{p.x},{p.y},{p.z},{c.getTag('material')},{m['speed']},{c.getTag('bounciness') or '1.3'},{c.getTag('max_height') or '0.0'}"
+            kind = "L" if m.get("loop",False) else "M"
+            l = f"{kind},{p.x},{p.y},{p.z},{c.getTag('material')},{m['speed']},{c.getTag('bounciness') or '1.3'},{c.getTag('max_height') or '0.0'}"
             for w in m['waypoints']: l += f",{w.x},{w.y},{w.z}"
             buf.append(l + "\n")
         return "".join(buf)
@@ -480,7 +520,7 @@ class WorldManager:
                     else: records.append('CP,S,' + ','.join(map(str, value)))
             for r in blocks + movers:
                 moving = 'speed' in r
-                fields = ['M' if moving else 'B', *r['pos'], r['mat']]
+                fields = [('L' if r.get('loop',False) else 'M') if moving else 'B', *r['pos'], r['mat']]
                 if moving: fields += [r['speed'], r['bounce'], r['max_h'], *[v for w in r['waypoints'] for v in w]]
                 elif r['mat'] == 5: fields += [r['bounce'], r['max_h']]
                 records.append(','.join(map(str, fields)))
@@ -576,7 +616,8 @@ class WorldManager:
                         if len(parts) not in (5, 7): raise ValueError("bad block record")
                         rec['pos'] = self._vec(parts[1:4]); rec['mat'] = self._material(parts[4])
                         if len(parts) == 7: rec['bounce'] = self._num(parts[5], *self.BOUNCE_RANGE); rec['max_h'] = self._num(parts[6], *self.MAX_H_RANGE)
-                    elif kind == "M":
+                    elif kind in ("M", "L"):
+                        rec['loop'] = kind == "L"
                         if len(parts) < 8: raise ValueError("bad mover record")
                         rec['pos'] = self._vec(parts[1:4]); rec['mat'] = self._material(parts[4])
                         rec['speed'] = self._num(parts[5], *self.SPEED_RANGE)
@@ -671,6 +712,8 @@ class WorldManager:
         for m in self.moving_cubes: self.recycle_cube(m['np'])
 
         self.cubes = [c for c in self.cubes if c == self.god_collision_floor]
+        self.static_cube_order.clear()
+        self.next_cube_order = 0
         self.cube_map = {}; self.moving_cubes = []; self.active_checkpoint_cube = None; self.saved_checkpoint_pos = None
 
         for rec in blocks:
@@ -680,7 +723,7 @@ class WorldManager:
             self.request_chunk_update(rec['pos'])
         for rec in movers:
             c = self._make_block(rec)
-            self.moving_cubes.append({'np': c, 'waypoints': rec['waypoints'], 'speed': rec['speed'], 'current_idx': 0, 'wait_timer': 0, 'origin': rec['pos'], 'direction': 1})
+            self.moving_cubes.append({'np': c, 'waypoints': rec['waypoints'], 'speed': rec['speed'], 'current_idx': 0, 'wait_timer': 0, 'origin': rec['pos'], 'direction': 1, 'loop': rec.get('loop',False)})
             self.update_cube_faces(c)
 
         if properties is not None:
@@ -718,3 +761,4 @@ class WorldManager:
         if gm and not self.visual_floor.isHidden():
             if self.god_collision_floor not in self.cubes: self.cubes.append(self.god_collision_floor)
         elif self.god_collision_floor in self.cubes: self.cubes.remove(self.god_collision_floor)
+        self.god_floor_enabled = bool(gm and not self.visual_floor.isHidden())

@@ -221,10 +221,10 @@ def upward(tmp):
 @proof('B09 arrival frames carry the rider by the exact displacement')
 def arrival(tmp):
     w=world(tmp); m=mover(w,wp=(1,0,.5)); m['np'].setX(.8); a=app(w); a.physics.player.setPos(.8,0,1)
-    a.update_world(TASK); assert m['np'].getX()==1 and abs(a.physics.player.getX()-1)<1e-6
+    a.update_world(TASK); assert abs(m['np'].getX()-.9)<1e-6 and abs(a.physics.player.getX()-.9)<1e-6
     a.update_world(TASK); assert abs(a.physics.player.getX()-m['np'].getX())<1e-6  # reversal frame
     w=world(tmp); m=mover(w,wp=(5,0,.5)); m['current_idx']=0; a=app(w); a.physics.player.setPos(0,0,1)
-    a.update_world(TASK); assert m['np'].getX()==0 and a.physics.player.getX()==0  # zero-distance frame
+    a.update_world(TASK); assert abs(m['np'].getX()-.3)<1e-6 and abs(a.physics.player.getX()-.3)<1e-6  # no zero-distance pause
     print('  arrival, reversal and zero-distance frames move rider with platform')
 
 @proof('B10 platforms cannot push the player through walls or ceilings')
@@ -327,7 +327,7 @@ def unrelated_reset(tmp):
     new=w.moving_cubes[-1]; assert new['np'].getX()==3 and new['origin'].x==1 and m['np'].getX()==2
     print('  unrelated mover stays at x=35; new block joins in lockstep (origin x=1, now x=3)')
 
-@proof('B20 R does not edit the map while paused, works after closing menu')
+@proof('B20 waypoint deletion does not edit the map while paused, works after closing menu')
 def paused_undo(tmp):
     w=world(tmp); m=mover(w); a=app(w); a.tool_mode=7; a.selected_movers=[m]; a.paused=True; a.menu_open=True
     with immediate(): a.undo_wp()
@@ -570,7 +570,7 @@ def two_modes(tmp):
 
 @proof('E12 restored tool selection colors apply to ordinary and glowing static/moving blocks')
 def tool_colors(tmp):
-    colors=App.SELECTION_COLORS; assert len(set(colors.values()))==5
+    colors=App.SELECTION_COLORS; assert len(set(colors.values()))==6
     for tool,color in colors.items():
         w=world(tmp); c=cube(w); m=mover(w,(3,0,.5),'3'); a=app(w); a.tool_mode=tool
         a.selected_objects=[c,m['np']]; a.refresh_object_selection(); w.update_chunks()
@@ -985,8 +985,11 @@ def combined_tools(tmp):
         with immediate():
             if tool==8: a.adj_val(1); a.adj_h(1); assert c.getTag('bounciness')=='1.4' and float(c.getTag('max_height'))>0
             elif tool==9: a.adjust_checkpoint(1); assert float(c.getTag('heading'))==15
-            else: a.group_selection(); assert c.getTag('group')
+            else: a.group_selection(); assert not c.getTag('group')
         a.pick_object=lambda:d; a.select_object(); assert d in a.selected_objects
+        if tool==10:
+            with immediate(): a.group_selection()
+            assert c.getTag('group') and c.getTag('group')==d.getTag('group')
         a.ui=NS(tool_text=Text(),format_number=str)
         App.update_hud(a); text=a.ui.tool_text.text
         assert 'Tab' not in text and 'SELECT' not in text and 'TINKER' not in text
@@ -1018,10 +1021,10 @@ def specialized_groups(tmp):
 @proof('E40 flight speed uses one cue pitched by direction, only when speed changes')
 def flight_speed_audio(tmp):
     a=app(world(tmp)); a.ui=NS(gui_hidden=True); sounds=[]; a.play_sfx=lambda *args:sounds.append(args)
-    a.adj_fly(1); assert a.physics.fly_speed==11 and sounds==[('flight_speed',1.12)]
-    a.adj_fly(-1); assert a.physics.fly_speed==10 and sounds[-1]==('flight_speed',.88)
+    a.adj_fly(1); assert a.physics.fly_speed==11 and sounds==[('checkpoint_turn',1.12)]
+    a.adj_fly(-1); assert a.physics.fly_speed==10 and sounds[-1]==('checkpoint_turn',.88)
     a.physics.fly_speed=1; a.adj_fly(-1); assert len(sounds)==2
-    a.adj_fly(1); assert sounds[-1]==('flight_speed',1.12) and len(sounds)==3
+    a.adj_fly(1); assert sounds[-1]==('checkpoint_turn',1.12) and len(sounds)==3
     assert all((ROOT/'assets'/'sounds'/(name[0]+'.mp3')).is_file() for name in sounds)
 
 @proof('E41 jumping on landing or immediately afterward suppresses the landing cue')
@@ -1084,12 +1087,12 @@ def direct_sound_variation(tmp):
         assert p.checkpoint_sfx.rates==[1.0,1.1] and p.checkpoint_sfx.times==[.3,.3]
         assert not p.checkpoint_sfx.volumes and p.checkpoint_sfx.plays==2
 
-@proof('E44 trampoline height is restored to one cue, with variation through shared playback')
+@proof('E44 trampoline height uses the Checkpoint numeric cue in both directions')
 def height_sound_directions(tmp):
     w=world(tmp); c=cube(w,material='5'); a=app(w); a.tool_mode=8
     a.selected_objects=[c]; a.selected_trampolines=[c]; sounds=[]; a.play_sfx=lambda *args:sounds.append(args)
     with immediate(): a.adj_h(1); a.adj_h(-1)
-    assert sounds==[('trampoline_height',1.12),('trampoline_height',.88)]
+    assert sounds==[('checkpoint_turn',1.12),('checkpoint_turn',.88)]
     assert all((ROOT/'assets'/'sounds'/(sound[0]+'.mp3')).is_file() for sound in sounds)
 
 @proof('E45 presence uses the fixed public ID and saved visibility preferences, ignoring legacy ID settings')
@@ -1101,7 +1104,7 @@ def presence_preferences(tmp):
     Path(a.settings_file).write_text(json.dumps(initial)); a.load_settings()
     assert 'Discord Application ID' not in a.saved_settings
     a.save_setting('Discord Show Activity',True); a.load_settings()
-    assert a.saved_settings['Discord Show Activity'] is True and a.saved_settings['Sound'] is True
+    assert 'Discord Show Activity' not in a.saved_settings and 'Sound' not in a.saved_settings
     with patch.dict(os.environ,{'DISEPSHUN_DISCORD_APP_ID':'123'}):
         p=DiscordPresence(a.saved_settings)
     assert p.client_id=='1566233876823678996'
@@ -1177,7 +1180,9 @@ def shared_direction_audio(tmp):
         c=cube(w,(4,0,.5),'4');a.tool_mode=9;a.selected_objects=[c]
         a.adjust_checkpoint(1);a.adjust_checkpoint(-1)
         a.adj_fly(1);a.adj_fly(-1)
-    assert all(sound.rates==[1.12,.88] and sound.volumes==[.97,.97] for sound in a.sfx.values())
+    assert a.sfx['checkpoint_turn'].rates==[1.12,.88]*5
+    assert a.sfx['checkpoint_turn'].volumes==[.97]*10
+    assert all(sound.plays==0 for name,sound in a.sfx.items() if name!='checkpoint_turn')
 
 @proof('E49 GPU advice requires a known lower-priority renderer and a distinct preferred hardware adapter')
 def gpu_detection(tmp):
@@ -1195,19 +1200,18 @@ def gpu_detection(tmp):
     assert gpu_recommendation('',power,performance) is None
     assert gpu_recommendation(low['name'],[],[]) is None
 
-@proof('E50 GPU notice checks each launch unless opted out and Escape closes it without opening Settings')
+@proof('E50 GPU overview appears once, persists across launches, and Escape closes it')
 def gpu_startup_and_escape(tmp):
     a=app(world(tmp)); notices=[]; a.saved_settings={}
     a.ui=NS(show_gpu_notice=lambda info:notices.append(info))
     a.win=NS(getGsg=lambda:NS(getDriverRenderer=lambda:'Intel UHD Graphics 770'))
     info={'current':'Intel UHD Graphics 770','recommended':'NVIDIA GeForce RTX 3050'}
-    with patch('disepshun.gpu_advice.check_renderer',return_value=info) as check:
+    a.settings_file=str(Path(tmp)/'settings.json')
+    with patch('disepshun.gpu_advice.renderer_info',return_value=info) as check:
         a.check_startup_gpu();a.check_startup_gpu()
-        assert notices==[info,info] and check.call_count==2
-        a.saved_settings['Hide Low Power GPU Warning']=True;a.check_startup_gpu()
-        assert check.call_count==2
-    a.settings_file=str(Path(tmp)/'settings.json');a.save_setting('Hide Low Power GPU Warning',True)
-    a.load_settings();assert a.saved_settings['Hide Low Power GPU Warning'] is True
+        assert notices==[info] and check.call_count==1
+        a.load_settings();assert a.saved_settings['GPU Notice Shown'] is True
+        a.check_startup_gpu(); assert check.call_count==1
     a.gpu_notice_open=True;a.paused=True
     a.ui.close_gpu_notice=lambda:setattr(a,'gpu_notice_open',False)
     a.toggle_menu();assert not a.gpu_notice_open and not a.menu_open
@@ -1232,6 +1236,466 @@ def menu_close_mouse(tmp):
     a.toggle_menu(); assert a.menu_open
     a.ignore_mouse_input=False
     a.toggle_menu(); assert not a.menu_open and warps[-1]==(0,50,50) and a.ignore_mouse_input
+
+@proof('E53 crouch plays once per transition and increases gravity during ascent and descent')
+def crouch_fall(tmp):
+    sounds=[]
+    with patch.object(builtins.base, 'play_sfx', side_effect=lambda *args:sounds.append(args)):
+        p=physics(world(tmp)); p.player.setZ(20); p.vz=-2; p.ground=False
+        keys=dict(KEYS,lshift=True)
+        p.update(.02,keys); fast=p.vz
+        p.update(.02,keys)
+        assert [x[0] for x in sounds].count('crouch')==1
+        p.update(.02,KEYS); p.update(.02,keys)
+        assert [x[0] for x in sounds].count('crouch')==2
+        q=physics(world(tmp)); q.player.setZ(20); q.vz=-2; q.ground=False; q.update(.02,KEYS)
+        assert fast < q.vz
+        p.vz=q.vz=5; p.ground=q.ground=False
+        p.update(.02,keys); q.update(.02,KEYS)
+        assert 0 < p.vz < q.vz
+        assert abs((5-p.vz)-2.5*(5-q.vz))<1e-6
+    assert (ROOT/'assets'/'sounds'/'crouch.mp3').stat().st_size>0
+
+@proof('E54 fill handles reversed corners, materials, checkers, obstacles, and undo/redo')
+def fill_boxes(tmp):
+    for mode in range(1,7):
+        w=world(tmp); a=app(w); a.tool_mode=12; a.fill_material=mode
+        a.physics.player.setPos(30,30,30)
+        existing=cube(w,(0,0,.5),'3')
+        a.preview.setPos(1,1,1.5); a.fill_corner(); assert len(w.cubes)==1
+        a.preview.setPos(0,0,.5); a.fill_corner()
+        assert len(w.cubes)==8 and existing in w.cubes and a.fill_start is None
+        for c in w.cubes:
+            if c==existing: continue
+            x,y,z=c.getPos(); expected=1+(int(x+y+z-.5)%2) if mode==6 else mode
+            assert int(c.getTag('material'))==expected
+        assert a.history_step() and w.cubes==[existing]
+        assert a.history_step(True) and len(w.cubes)==8
+    a.fill_start=V(0,0,.5); a.delete(); assert a.fill_start is None
+    a.fill_start=V(0,0,.5); a.preview.setPos(100,100,100.5)
+    a.editor_notice=lambda text:None; a.fill_corner(); assert len(w.cubes)==8
+
+@proof('E55 hollow fill omits interior cells; mode and cancellation have distinct cues')
+def hollow_fill(tmp):
+    w=world(tmp); a=app(w); a.tool_mode=12; a.physics.player.setPos(30,30,30)
+    sounds=[]; a.play_sfx=lambda *args:sounds.append(args[0])
+    a.toggle_fill_solid(); assert a.fill_solid is False
+    a.preview.setPos(0,0,.5); a.fill_corner()
+    a.preview.setPos(2,2,2.5); a.fill_corner()
+    assert len(w.cubes)==26 and w.get_grid_key(V(1,1,1.5)) not in w.cube_map
+    assert sounds==['toggle','place','place']
+    a.fill_corner(); a.cancel_fill(); assert sounds[-1]=='break' and a.fill_start is None
+    a.toggle_fill_solid(); assert a.fill_solid and sounds[-1]=='toggle'
+    assert a.history_step() and not w.cubes
+    assert a.history_step(True) and len(w.cubes)==26
+    for name in ('fill_material','fill_point','fill_cancel','fill_solid','fill_hollow','fill_complete','fill_error','uncrouch'):
+        assert (ROOT/'assets'/'sounds'/(name+'.mp3')).stat().st_size>0
+
+@proof('E56 uncrouch cue waits for clearance and uses shared sound variation')
+def uncrouch_clearance(tmp):
+    w=world(tmp); p=physics(w); p.player.setZ(20); p.was_crouching=True
+    sounds=[]
+    with patch.object(builtins.base,'play_sfx',side_effect=lambda *args:sounds.append(args[0])):
+        with patch.object(p,'check_collision',return_value=True): p.update(.01,KEYS)
+        assert 'uncrouch' not in sounds
+        with patch.object(p,'check_collision',return_value=False):
+            p.update(.01,KEYS); p.update(.01,KEYS)
+        assert sounds.count('uncrouch')==1
+
+@proof('E57 GPU overview lists all other hardware and handles enumeration failure')
+def gpu_overview(tmp):
+    from disepshun.gpu_advice import renderer_info
+    adapters=[dict(name='Intel UHD Graphics 770',id=1),dict(name='NVIDIA RTX 3050',id=2),dict(name='AMD Radeon RX 6600',id=3)]
+    with patch('disepshun.gpu_advice.windows_adapter_orders',return_value=(adapters,adapters[::-1])):
+        info=renderer_info('Intel(R) UHD Graphics 770')
+        assert info['current']=='Intel(R) UHD Graphics 770'
+        assert info['others']==['AMD Radeon RX 6600','NVIDIA RTX 3050'] and info['enumerated']
+    with patch('disepshun.gpu_advice.windows_adapter_orders',return_value=([],[])):
+        assert not renderer_info('Unknown')['enumerated']
+
+@proof('E58 compressed settings migrate legacy preferences and save only nondefaults')
+def compact_settings(tmp):
+    a=App.__new__(App); a.settings_file=str(Path(tmp)/'settings.json.gz')
+    legacy=Path(tmp)/'settings.json'
+    legacy.write_text(json.dumps(dict(App.DEFAULT_SETTINGS, Sound=False, **{'Relative Waypoints':True})))
+    a.load_settings()
+    assert a.saved_settings=={'Sound':False} and not legacy.exists()
+    assert json.loads(gzip.decompress(Path(a.settings_file).read_bytes()))=={'Sound':False}
+    a.save_setting('Sound',True); a.load_settings(); assert a.saved_settings=={}
+    assert gzip.decompress(Path(a.settings_file).read_bytes())==b'{}'
+    for key,default in App.DEFAULT_SETTINGS.items():
+        a.save_setting(key,not default); a.load_settings(); assert a.saved_settings[key] is not default
+        a.save_setting(key,default); a.load_settings(); assert key not in a.saved_settings
+
+@proof('E59 mover steps consume remaining distance through corners and close loop paths')
+def smooth_loop_motion(tmp):
+    G['globalClock']=NS(getDt=lambda: .1)
+    w=world(tmp); a=app(w); m=mover(w,wp=(1,0,.5))
+    m['waypoints'].append(V(1,1,.5)); m['speed']=3
+    m['np'].setX(.9); m['loop']=True
+    a.update_world(TASK); assert (m['np'].getPos()-V(1,.2,.5)).length()<1e-6
+    m['np'].setPos(1,.9,.5); m['current_idx']=2
+    a.update_world(TASK)
+    expected=V(1,1,.5)-V(1,1,0).normalized()*.2
+    assert (m['np'].getPos()-expected).length()<1e-6 and m['current_idx']==0
+    m['loop']=False; m['np'].setPos(1,.9,.5); m['current_idx']=2; m['direction']=1
+    a.update_world(TASK); assert (m['np'].getPos()-V(1,.8,.5)).length()<1e-6
+    # Duplicate points and speeds crossing many tiny segments must terminate.
+    m['origin']=V(0,0,.5); m['waypoints']=[V(0,0,.5),V(.01,0,.5)]
+    m['np'].setPos(m['origin']); m['current_idx']=0; m['speed']=100; m['loop']=True
+    a.update_world(TASK); assert math.isfinite(m['np'].getX())
+
+@proof('E60 loop mode survives toggles, undo/redo, save/reload, copying and attached blocks')
+def loop_persistence(tmp):
+    w=world(tmp); a=app(w); m=mover(w); a.tool_mode=7
+    a.selected_objects=[m['np']]; a.selected_movers=[m]
+    with immediate(): a.toggle_mover_loop()
+    assert m['loop']; a.history_step(); assert not w.moving_cubes[0]['loop']
+    a.history_step(True); assert w.moving_cubes[0]['loop']
+    save(w); w.load_map(); assert not w.load_errors and w.moving_cubes[0]['loop']
+    a.selected_objects=[w.moving_cubes[0]['np']]; a.selection_command('copy'); a.preview.setPos(10,0,.5)
+    with immediate(): a.selection_command('paste')
+    assert w.moving_cubes[-1]['loop']
+    a.tool_mode=1; a.preview.setPos(11,0,.5); hit(a,w.moving_cubes[-1]['np'])
+    with immediate(): a.place()
+    assert w.moving_cubes[-1]['loop']
+    a.paused=True
+    a.toggle_mover_loop(); assert w.moving_cubes[-1]['loop']
+
+@proof('E61 loading below the initial spawn resets fall height; actual falls still sound once')
+def spawn_landing_audio(tmp):
+    recordings=[]
+    with patch.object(builtins.base,'play_sfx',lambda *args:recordings.append(args)):
+        w=world(tmp); cube(w,(0,0,-9.5)); p=physics(w)
+        p.set_spawn_position(V(0,0,-9)); p.pending_land=None
+        for _ in range(50): p.update(.01,KEYS)
+        assert p.ground and not [s for s in recordings if s[0]=='land']
+        p.set_spawn_position(V(0,0,-6))
+        for _ in range(200): p.update(.01,KEYS)
+        assert p.ground and len([s for s in recordings if s[0]=='land'])==1
+
+@proof('E62 GPU window explains Python GPU selection and plays menu cues once per open/close')
+def gpu_window_audio(tmp):
+    widgets=[]; sounds=[]
+    class Widget:
+        def __init__(self,**kw): self.options=kw; self.destroyed=False; widgets.append(self)
+        def setScale(self,*args): pass
+        def getCanvas(self): return self
+        def destroy(self): self.destroyed=True
+    a=app(world(tmp)); a.play_sfx=lambda *args:sounds.append(args)
+    a.aspect2d=NP('aspect2d'); a.getAspectRatio=lambda:16/9
+    a.win=NS(requestProperties=lambda *args:None); a.center_mouse=lambda:None
+    ui=G['GameUI'].__new__(G['GameUI']); ui.base=a
+    gui=dict(DirectFrame=Widget,DirectLabel=Widget,DirectButton=Widget,
+             DGG=NS(NORMAL=0,DISABLED=1))
+    with patch.dict(G,gui), patch.dict(sys.modules,{'direct.gui.DirectGui':NS(DirectScrolledFrame=Widget)}):
+        ui.show_gpu_notice(dict(current='Intel',others=['NVIDIA'],enumerated=True))
+        ui.show_gpu_notice({})
+        assert any('Python can sometimes be set to use the less powerful GPU.' in w.options.get('text','') for w in widgets)
+        ui.close_gpu_notice(); ui.close_gpu_notice()
+    assert sounds==[('menu_open',),('menu_close',)] and not a.gpu_notice_open and not a.paused
+
+@proof('E63 moving riders stay on the platform across repeated world and physics updates')
+def synchronized_platform_updates(tmp):
+    dt=1/120
+    G['globalClock']=NS(getDt=lambda: dt)
+    try:
+        for target in ((4,0,.5),(0,0,4.5),(0,0,-3.5)):
+            w=world(tmp); a=app(w); m=mover(w,wp=target)
+            a.physics.player.setPos(0,0,1); a.physics.ground=True
+            for _ in range(400):
+                a.update_world(TASK); a.physics.update(dt,KEYS)
+                expected=m['np'].getPos()+V(0,0,.5)
+                assert (a.physics.player.getPos()-expected).length()<1e-4
+                assert a.physics.ground
+    finally: G['globalClock']=NS(getDt=lambda: .1)
+
+@proof('E64 Selection, Grouping and object selection retain their original cues')
+def restored_selection_audio(tmp):
+    w=world(tmp); a=app(w); sounds=[]; a.play_sfx=lambda *args:sounds.append(args)
+    c=cube(w); d=cube(w,(3,0,.5)); a.pick_object=lambda:c
+    for tool in (10,11):
+        a.tool_mode=tool; a.tool_phases[tool]='select'; a.selected_objects=[]
+        a.select_object(); a.select_object()
+        assert sounds[-2:]==[('object_select',),('object_deselect',)]
+    a.selected_objects=[c,d]; a.tool_mode=10
+    with immediate(): a.group_selection(); a.group_selection()
+    assert sounds[-2:]==[('group',),('ungroup',)]
+    a.tool_mode=11; a.tool_phases[11]='select'
+    a.selection_command('all'); a.selection_command('clear')
+    assert sounds[-2:]==[('selection_all',),('selection_clear',)]
+    a.tool_phases[11]='tinker'; a.selected_objects=[c]
+    a.selection_command('copy'); a.preview.setPos(8,0,.5)
+    with immediate():
+        a.selection_command('paste'); a.transform_selection(1,0,0)
+        a.transform_selection(rotate=True); a.selection_command('cut')
+    assert sounds[-5:]==[('copy',),('paste',),('move',),('rotate',),('cut',)]
+    a.selected_objects=[d]
+    with immediate(): a.selection_command('delete')
+    assert sounds[-1]==('delete',)
+    a.toggle_tool_phase(); a.toggle_tool_phase()
+    assert sounds[-2:]==[('mode_select',),('mode_tinker',)]
+
+@proof('E65 every tool has the Waypoint translucent magenta unshaded cursor preview')
+def unified_tool_previews(tmp):
+    a=app(world(tmp)); a.preview_shading=True; a.hotbar_page=1
+    a.ui=NS(update_selection=lambda *args:None,show_item_name=lambda *args:None)
+    a.world.dlnp=NP(core.DirectionalLight('sun')); a.world.alnp=NP(core.AmbientLight('ambient'))
+    for tool in a.TOOL_SLOTS:
+        a.set_tool(tool)
+        assert tuple(a.preview.getColorScale())==(1,0,1,.5)
+        assert a.preview.getAttrib(core.LightAttrib).hasAllOff()
+        assert a.preview.getShader() is None
+        # Changing the shading preference while a tool is active keeps this style.
+        a.toggle_preview_shading(False); a.toggle_preview_shading(True)
+        assert a.preview.getAttrib(core.LightAttrib).hasAllOff()
+        assert a.preview.getShader() is None
+    a.set_tool(2)
+    assert tuple(round(v,2) for v in a.preview.getColorScale())==(.4,.4,.4,.5)
+    assert a.preview.getAttrib(core.LightAttrib).getNumOnLights()==2
+    a.toggle_preview_shading(False)
+    assert a.preview.getAttrib(core.LightAttrib).hasAllOff()
+
+@proof('E66 block actions share left/right click cues without duplicate Fill success sounds')
+def shared_block_action_audio(tmp):
+    w=world(tmp); a=app(w); sounds=[]; a.play_sfx=lambda *args:sounds.append(args)
+    with patch.object(G['random'],'uniform',return_value=1):
+        a.play_block_action(False); a.play_block_action(True)
+        assert sounds==[('break',1),('place',1)]
+        sounds.clear(); a.tool_mode=7; a.selected_objects=[cube(w)]; a.preview.setPos(4,0,.5)
+        with immediate(): a.handle_place_wp()
+        assert sounds==[('place',1)]
+        sounds.clear(); a.tool_mode=12; a.preview.setPos(8,0,.5)
+        a.fill_corner(); a.cancel_fill()
+        assert sounds==[('place',1),('break',1)]
+        sounds.clear(); a.fill_corner(); a.preview.setPos(9,0,.5); a.fill_corner()
+        assert sounds==[('place',1),('place',1)]
+
+@proof('E67 vertical rotation updates blocks, mover paths, indexes and history')
+def vertical_rotation(tmp):
+    w=world(tmp); a=app(w); a.tool_mode=11
+    c=cube(w); m=mover(w,(0,2,.5),wp=(0,4,.5))
+    a.selected_objects=[c,m['np']]
+    with immediate(): a.transform_selection(rotate=True,rotate_axis='x')
+    assert c.getPos()==V(0,1,-.5) and m['np'].getPos()==V(0,1,1.5)
+    assert m['origin']==V(0,1,1.5) and m['waypoints']==[V(0,1,3.5)]
+    assert w.cube_map[w.get_grid_key(c.getPos())]==c
+    assert a.history_step(); assert w.moving_cubes[0]['waypoints']==[V(0,4,.5)]
+    assert a.history_step(True); assert w.moving_cubes[0]['waypoints']==[V(0,1,3.5)]
+    save(w); w.load_map(); assert w.moving_cubes[0]['waypoints']==[V(0,1,3.5)]
+
+@proof('E68 grouping requires two distinct blocks, leaves singleton edits and saves untouched')
+def reject_single_groups(tmp):
+    w=world(tmp); a=app(w); a.tool_mode=10; c=cube(w)
+    sounds=[]; a.play_sfx=lambda *args:sounds.append(args)
+    for selected in ([],[c],[c,c]):
+        a.selected_objects=selected
+        with immediate(): a.group_selection(False)
+        assert not c.getTag('group') and not hasattr(a,'edit_history')
+        assert not Path(w.save_file).exists() and not sounds
+    d=cube(w,(3,0,.5)); a.selected_objects=[c,d]
+    with immediate(): a.group_selection()
+    assert c.getTag('group')==d.getTag('group') and c.getTag('group')
+
+@proof('E69 Waypoint left click removes only the last waypoint in Tinker and selects in Select')
+def left_click_waypoints(tmp):
+    w=world(tmp); a=app(w); m=mover(w); m['waypoints'].append(V(8,0,.5))
+    a.tool_mode=7; a.selected_objects=[m['np']]; a.selected_movers=[m]
+    sounds=[]; a.play_sfx=lambda *args:sounds.append(args)
+    with immediate(): a.delete()
+    assert m['waypoints']==[V(5,0,.5)] and sounds[-1][0]=='break'
+    assert a.history_step(); assert len(w.moving_cubes[0]['waypoints'])==2
+    m=w.moving_cubes[0]; a.tool_phases[7]='select'; a.pick_object=lambda:m['np']
+    a.delete(); assert a.selected_objects==[m['np']] and len(m['waypoints'])==2
+    assert sounds[-1][0]=='object_select'
+
+@proof('E70 Shift-modified mouse clicks, tool keys and releases reach existing actions')
+def shift_actions(tmp):
+    from direct.showbase.DirectObject import DirectObject
+    from direct.showbase.MessengerGlobal import messenger
+    a=app(world(tmp)); owner=DirectObject(); a.accept=owner.accept; a.disableMouse=lambda:None
+    actions=[]; a.toggle_hotbar=lambda:actions.append('hotbar')
+    a.handle_slot=lambda slot:actions.append(('slot',slot))
+    a.transform_selection=lambda *args:actions.append(('transform',args))
+    history=[]; a.history_step=lambda *args:history.append(args)
+    a.setup_input()
+    try:
+        for shift in ('lshift','rshift'):
+            messenger.send('raw-'+shift)
+            for button in ('mouse1','mouse3'):
+                messenger.send('shift-'+button); assert a.keyMap[button]
+                messenger.send('shift-'+button+'-up'); assert not a.keyMap[button]
+                messenger.send('shift-'+button); messenger.send('raw-'+shift+'-up')
+                messenger.send(button+'-up'); assert not a.keyMap[button]
+            messenger.send('shift-q'); messenger.send('shift-1'); messenger.send('shift-t')
+        assert actions==['hotbar',('slot',1),('transform',(0,0,0,True,False,'x'))]*2
+        messenger.send('raw-lcontrol')
+        messenger.send('control-shift-z'); messenger.send('shift-control-y')
+        messenger.send('raw-lcontrol-up')
+        assert history==[(),(True,)]
+    finally: owner.ignoreAll()
+
+@proof('E71 undo/redo and hotbar switches play distinct cues only on successful actions')
+def history_hotbar_sounds(tmp):
+    w=world(tmp); a=app(w); sounds=[]; a.play_sfx=lambda *args:sounds.append(args)
+    assert not a.history_step() and not a.history_step(True) and not sounds
+    a.preview.setPos(4,0,.5)
+    with immediate(): a.place()
+    sounds.clear(); assert a.history_step(); assert a.history_step(True)
+    assert sounds==[('undo',),('redo',)]
+    assert not a.history_step(True); assert len(sounds)==2
+    a.hotbar_page=0; a.preview_shading=False
+    a.ui=NS(update_hotbar_layout=lambda *args:None,update_selection=lambda *args:None,show_item_name=lambda *args:None)
+    sounds.clear(); a.toggle_hotbar(); a.toggle_hotbar()
+    assert sounds==[('hotbar_tools',),('hotbar_blocks',)]
+    a.paused=True; a.toggle_hotbar(); assert len(sounds)==2
+    for name in ('undo','redo','hotbar_tools','hotbar_blocks'):
+        assert (ROOT/'assets'/'sounds'/(name+'.mp3')).stat().st_size>0
+
+@proof('P01 collision queries match brute force for off-grid blocks, boundaries, movers and ignored contacts')
+def optimized_contacts(tmp):
+    import random
+    rng=random.Random(7401); w=world(tmp); p=physics(w)
+    for _ in range(180):
+        pos=V(*(rng.uniform(-5,5) for _ in range(3)))
+        if w.get_grid_key(pos) not in w.cube_map: cube(w,pos)
+    for _ in range(15): mover(w,tuple(rng.uniform(-6,6) for _ in range(3)))
+    positions=[V(*(rng.uniform(-7,7) for _ in range(3))) for _ in range(750)]
+    for c in w.cubes[:20]:
+        cp=c.getPos()
+        positions.extend((cp+V(.7,0,0),cp-V(.7,0,0),cp+V(0,0,.5),cp-V(0,0,2.17)))
+    positions.extend((V(-10000,0,0),V(10000,0,0),V(0,0,1000),V(999,0,-20.1)))
+    for enabled in (False,True):
+        w.visual_floor.show(); w.update_god_collision(enabled)
+        for i,pos in enumerate(positions):
+            h=(.9,1.23,1.67)[i%3]
+            ignore=tuple(w.cubes[:4]) if i%4==0 else ()
+            floor,hits=p.get_contacts(pos,h,ignore)
+            if not (-10000<pos.x<10000 and -10000<pos.y<10000 and -1000<pos.z<1000):
+                assert floor and not hits; continue
+            def overlap(c,half=.5):
+                cp=c.getPos(w.render)
+                return (pos.x-p.w/2<cp.x+half and pos.x+p.w/2>cp.x-half and
+                        pos.y-p.w/2<cp.y+half and pos.y+p.w/2>cp.y-half and
+                        pos.z<cp.z+.5 and pos.z+h>cp.z-.5)
+            expected=[m['np'] for m in w.moving_cubes if m['np'] not in ignore and overlap(m['np'])]
+            expected.extend(c for _,c in sorted(w.cube_map.items()) if c not in ignore and overlap(c))
+            assert hits==expected, (pos,h,hits,expected)
+            assert floor==bool(enabled and overlap(w.god_collision_floor,w.FLOOR_HALF))
+    w.visual_floor.hide(); w.update_god_collision(True)
+    assert not w.god_floor_enabled and w.god_collision_floor not in w.cubes
+    save(w); w.load_map(); assert not w.god_floor_enabled
+    w.visual_floor.show(); w.update_god_collision(True)
+    save(w); w.load_map()
+    assert w.god_floor_enabled and w.god_collision_floor in w.cubes
+    assert p.get_contacts(V(999,0,-20.1),p.h_stand)[0]
+
+
+@proof('P02 nearby glow search retains nearest-light ordering through ties, moves, conversion, deletion and reload')
+def optimized_glow_search(tmp):
+    import random
+    rng=random.Random(401); w=world(tmp)
+    for i in range(160):
+        pos=V(rng.uniform(-45,45),rng.uniform(-45,45),rng.uniform(-3,3))
+        if w.get_grid_key(pos) not in w.cube_map: cube(w,pos,'134'[i%3])
+    tied=[cube(w,(-1,0,.5),'3'),cube(w,(1,0,.5),'4')]
+    for i in range(12): mover(w,(0,i-6,.5),'3' if i%2 else '4')
+    cameras=[V(0,0,.5),V(-16,16,0),V(-.001,-.001,2),V(32,-32,5),V(1000,1000,0)]
+    def check():
+        for pos in cameras:
+            expected=[c for c in w.all_blocks() if c.getTag('material') in ('3','4') and
+                      (c.getPos(w.render)-pos).lengthSquared()<225]
+            expected.sort(key=lambda c:(c.getPos(w.render)-pos).lengthSquared())
+            w.next_glow_scan=0; w.update_glow_lights(pos,now=0)
+            assert w.glow_sources==expected[:4]
+    check()
+    c=tied[0]; w.unregister_cube(c); w.cube_map.pop(w.get_grid_key(c.getPos()))
+    c.setPos(-17,16,.5); w.cube_map[w.get_grid_key(c.getPos())]=c; w.register_cube(c)
+    check()
+    w.convert_to_mover(c,dict(origin=c.getPos(),waypoints=[],speed=3.,current_idx=0,direction=1))
+    check(); w.remove_block(tied[1]); cube(w,(0,0,.5),'4'); check()
+    save(w); w.load_map(); check()
+
+
+@proof('P03 cached mover paths refresh after live waypoint, loop, transform, history and reload edits')
+def optimized_path_cache(tmp):
+    w=world(tmp); a=app(w); m=mover(w); a.tool_mode=7
+    a.selected_objects=[m['np']]; a.selected_movers=[m]
+    def check():
+        for m in w.moving_cubes:
+            points,circuit=w.mover_path(m)
+            expected=[m['origin']]+m['waypoints']
+            length=sum((b-a).length() for a,b in zip(expected,expected[1:]))
+            expected_length=length+(expected[-1]-expected[0]).length() if m.get('loop',False) else 2*length
+            assert points==expected and circuit==expected_length
+            assert w.mover_path(m)[0] is points
+    check()
+    a.preview.setPos(5,5,.5)
+    with immediate():
+        a.handle_place_wp(); check()
+        a.toggle_mover_loop(); check()
+        a.undo_wp(); check()
+        a.tool_mode=11; a.tool_phases[11]='tinker'
+        a.transform_selection(rotate=True,rotate_axis='x'); check()
+        assert a.history_step(); check()
+        assert a.history_step(True); check()
+    save(w); w.load_map(); check()
+
+
+@proof('P04 bloom retains shader inputs until buffer dimensions or padding change')
+def optimized_bloom_inputs(tmp):
+    import runpy
+    bloom=runpy.run_path(str(SRC/'bloom.py'))['NeonBloom']
+    effect=bloom.__new__(bloom); effect.input_sizes={}
+    inputs={}
+    # Shader quads are hashable NodePaths; wrap a real one to count writes.
+    class Quad:
+        def __init__(self): self.node=NP('quad'); self.calls=0
+        def setShaderInput(self,name,value):
+            self.calls+=1; self.node.setShaderInput(name,value); inputs[name]=value
+    quad=Quad(); tex=core.Texture('buffer'); tex.setup2dTexture(64,32,core.Texture.TUnsignedByte,core.Texture.FRgba)
+    effect.passes=[(quad,{'src':tex})]
+    effect.update(); assert quad.calls==2
+    scale=tex.getTexScale()
+    assert inputs['src_scale']==core.Vec2(scale.x,scale.y)
+    assert inputs['src_texel']==core.Vec2(1/(64*scale.x),1/(32*scale.y))
+    effect.update(); assert quad.calls==2
+    tex.setup2dTexture(128,64,core.Texture.TUnsignedByte,core.Texture.FRgba)
+    effect.update(); assert quad.calls==4
+    assert inputs['src_texel']==core.Vec2(1/128,1/64)
+    tex.setPadSize(16,8,0); effect.update(); assert quad.calls==6
+    scale=tex.getTexScale()
+    assert inputs['src_scale']==core.Vec2(scale.x,scale.y)
+    assert inputs['src_texel']==core.Vec2(1/(128*scale.x),1/(64*scale.y))
+    effect.manager=NS(cleanup=lambda:None); effect.cleanup()
+    assert not effect.passes and not effect.input_sizes
+
+
+@proof('P05 editor spatial validation matches exhaustive overlap checks, including thresholds and multi-block edits')
+def optimized_editor_overlap(tmp):
+    import random
+    rng=random.Random(9005); w=world(tmp); a=app(w); notices=[]
+    a.editor_notice=notices.append
+    for i in range(80):
+        pos=V(rng.uniform(-6,6),rng.uniform(-6,6),rng.uniform(-3,3))
+        if w.get_grid_key(pos) not in w.cube_map: cube(w,pos)
+    for i in range(8): mover(w,(rng.uniform(-6,6),rng.uniform(-6,6),rng.uniform(-3,3)))
+    cases=[[V(*(rng.uniform(-8,8) for _ in range(3))) for _ in range(i%12+1)] for i in range(150)]
+    cases.extend(([V(30,0,.5),V(30+d,0,.5)] for d in (.9989,.999,.9991,1.0)))
+    cases.extend(([V(0,0,-20)], [V(float('nan'),0,0)], [V(float('inf'),0,0)], [V(10001,0,0)]))
+    for i,positions in enumerate(cases):
+        ignored=w.all_blocks()[:10] if i%2 else []
+        others=[c.getPos() for c in w.all_blocks() if c not in ignored]
+        expected=True; reason=None
+        for j,p in enumerate(positions):
+            if any(not math.isfinite(v) or abs(v)>w.COORD_LIMIT for v in p) or p.z < -19.5:
+                expected=False; reason='Objects must stay inside the map bounds'; break
+            if any(all(abs(p[k]-q[k])<.999 for k in range(3)) for q in others+positions[:j]):
+                expected=False; reason='Edit blocked: objects would overlap'; break
+        notices.clear()
+        assert a.valid_positions(positions,ignored)==expected
+        assert notices==([reason] if reason else [])
+
 
 if __name__=='__main__':
     failures=[]

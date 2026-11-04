@@ -30,6 +30,11 @@ class PlayerPhysics:
         try: self.checkpoint_sfx = loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, "checkpoint.mp3")))
         except: self.checkpoint_sfx = None
 
+    def set_spawn_position(self, position):
+        self.player.setPos(position)
+        self.fall_peak_z = self.player.getZ()
+        self.pending_land = None
+
     def start_cyan_effect(self):
         if hasattr(builtins.base, 'particles_enabled') and not builtins.base.particles_enabled: return
         q = self.camera.getQuat(self.render)
@@ -48,9 +53,7 @@ class PlayerPhysics:
         ac = self.world_manager.active_checkpoint_cube
         if ac is not None and not ac.isEmpty() and not ac.getParent().isEmpty():
             self.checkpoint = ac.getPos(self.render) + VBase3(0, 0, 1)
-        self.player.setPos(self.checkpoint)
-        self.fall_peak_z=self.player.getZ()
-        self.pending_land = None
+        self.set_spawn_position(self.checkpoint)
         self.player.setHpr(float(ac.getTag("heading") or 0) if ac is not None and not ac.isEmpty() else 0, 0, 0)
         self.camera.setP(0)
         self.vz = 0; self.ground = False; self.coyote = 0.0; self.just_respawned = True; self.start_cyan_effect()
@@ -99,19 +102,21 @@ class PlayerPhysics:
 
         floor = False
         wm = self.world_manager
-        if wm.god_collision_floor in wm.cubes:
+        if wm.god_floor_enabled:
              gp = wm.god_collision_floor.getPos(self.render); fh = wm.FLOOR_HALF
              if (min_x < gp.x+fh and max_x > gp.x-fh and min_y < gp.y+fh and max_y > gp.y-fh and min_z < gp.z+0.5 and max_z > gp.z-0.5): floor = True
 
         try:
-            sx, ex = int(round(min_x)), int(round(max_x))
-            sy, ey = int(round(min_y)), int(round(max_y))
-            sz, ez = int(round(min_z+0.5)), int(round(max_z+0.5))
+            # A unit cube's rounded center key can overlap only these cells.
+            # The extra half-cell covers legacy blocks with off-grid centers too.
+            sx, ex = math.floor(min_x), math.ceil(max_x+1)
+            sy, ey = math.floor(min_y), math.ceil(max_y+1)
+            sz, ez = math.floor(min_z), math.ceil(max_z+1)
         except: return True, hits
 
-        for x in range(sx-1, ex+2):
-            for y in range(sy-1, ey+2):
-                for z in range(sz-1, ez+2):
+        for x in range(sx, ex):
+            for y in range(sy, ey):
+                for z in range(sz, ez):
                     if (c := wm.cube_map.get((x, y, z))) and c not in ignore and overlaps(c.getPos(self.render)): hits.append(c)
         return floor, hits
 
@@ -175,7 +180,7 @@ class PlayerPhysics:
 
         for mc in self.world_manager.moving_cubes: check_obj(mc['np'])
         gf = self.world_manager.god_collision_floor
-        if gf in self.world_manager.cubes:
+        if self.world_manager.god_floor_enabled:
             cp = gf.getPos(self.render)
             if check_area(cp.x, cp.y, cp.z, pp.x, pp.y, pp.z, self.world_manager.FLOOR_HALF) and cp.z+0.5 > hgz: hgz = cp.z+0.5; g_cube = None
 
@@ -285,6 +290,11 @@ class PlayerPhysics:
                 if self.check_collision(self.player.getPos(), self.h_stand, trigger_events=False):
                     wants_crouch = True
 
+            if wants_crouch and not getattr(self, "was_crouching", False):
+                builtins.base.play_sfx("crouch", 1.0, 0.9)
+            if not wants_crouch and getattr(self, "was_crouching", False):
+                builtins.base.play_sfx("uncrouch", 1.0, 0.85)
+            self.was_crouching = wants_crouch
             th = self.h_crouch if wants_crouch else self.h_stand
             t_head = self.head_crouch if wants_crouch else self.head_stand
             
@@ -295,7 +305,7 @@ class PlayerPhysics:
             if keys["space"] and (self.ground or self.coyote > 0):
                 self.vz = self.jump; self.ground = False; self.coyote = 0.0
                 builtins.base.play_sfx("jump", random.uniform(0.95, 1.05))
-            self.vz += self.g * dt
+            self.vz += self.g * dt * (2.5 if crouching and not self.ground else 1.0)
             dz = self.vz * dt; steps = max(1, math.ceil(abs(dz) / self.max_step))
             for _ in range(steps):
                 if self.vertical_step(dz / steps, keys): break

@@ -13,10 +13,6 @@ venv/
 *.tmp
 *.bak
 
-# Local notes and tools
-AIPrompt.txt
-FolderView*
-
 # Editors and OS
 .vscode/
 .idea/

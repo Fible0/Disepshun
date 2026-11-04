@@ -100,6 +100,7 @@ class NeonBloom:
     def __init__(self, win, cam, intensity=5.0):
         self.manager = FilterManager(win, cam)
         self.passes = []  # (quad, {input name: texture})
+        self.input_sizes = {}
         self.ok = False
         scene = self.texture('neon-scene')
         self.final = self.manager.renderSceneInto(colortex=scene, auxbits=AuxBitplaneAttrib.ABOGlow)
@@ -140,11 +141,16 @@ class NeonBloom:
         for quad, inputs in self.passes:
             for name, tex in inputs.items():
                 scale = tex.getTexScale()
-                quad.setShaderInput(name + '_scale', Vec2(scale.x, scale.y))
                 padx, pady = max(tex.getXSize(), 1), max(tex.getYSize(), 1)
+                key = (quad, name)
+                size = (scale.x, scale.y, padx, pady)
+                if self.input_sizes.get(key) == size: continue
+                self.input_sizes[key] = size
+                quad.setShaderInput(name + '_scale', Vec2(scale.x, scale.y))
                 # Texel size in the shaders' unpadded 0..1 coordinates.
                 quad.setShaderInput(name + '_texel', Vec2(1.0 / (padx * max(scale.x, 1e-6)), 1.0 / (pady * max(scale.y, 1e-6))))
 
     def cleanup(self):
         self.manager.cleanup()
         self.passes = []
+        self.input_sizes.clear()

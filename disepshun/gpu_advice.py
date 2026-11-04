@@ -99,3 +99,12 @@ def open_graphics_settings():
         return True
     except OSError:
         return False
+
+
+def renderer_info(renderer):
+    power, performance = windows_adapter_orders()
+    names = list(dict.fromkeys(a['name'] for a in performance + power))
+    current = _normalized(renderer)
+    others = [name for name in names if not (_normalized(name) in current or current in _normalized(name))] if current else names
+    return dict(current=renderer or 'Unknown renderer', others=others,
+                enumerated=bool(names))
