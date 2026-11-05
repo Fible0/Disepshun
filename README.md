@@ -1,6 +1,6 @@
 # Disepshun
 
-Disepshun is a Python 3 Panda3D obby game with an in-game map editor.
+A Panda3D obby game with an in-game map editor.
 
 ## Setup
 
@@ -12,6 +12,8 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
+Run the game:
+
 - Windows: `Run.cmd` or `py Main.py`
 - Linux: `./Run.sh` or `python3 Main.py`
 
@@ -20,84 +22,58 @@ python -m pip install -r requirements.txt
 | Key | Action |
 | --- | --- |
 | WASD / Mouse | Move / look |
-| Space | Jump / ascend while flying |
-| Left / Right Shift | Crouch / fall faster / descend while flying |
-| Right / Left click | Place / delete blocks; tool actions listed below |
-| Mouse wheel | Adjust build distance |
-| 1-5 | Blocks: white, gray, lethal red, checkpoint green, trampoline blue |
-| Q | Switch between Blocks and Tools hotbars |
-| Tab | Switch Select / Tinker for Waypoint and Selection |
-| LCtrl+Z / LCtrl+Y | Undo / redo up to 100 map edits |
-| - / = | Adjust the active tool's property |
-| Z / X | Decrease / increase trampoline maximum height |
-| [ / ] | Decrease / increase fly speed |
-| F / G | Toggle flight / invincibility |
-| Esc | Open / close Settings |
-
-Ctrl shortcuts use **Left Ctrl**. Tool controls also appear in the HUD.
+| Space | Jump / ascend (flying) |
+| Shift | Crouch / fall faster / descend (flying) |
+| Right / Left click | Place / delete blocks, or tool action |
+| Mouse wheel | Build distance |
+| 1-5 | Blocks: white, gray, lethal, checkpoint, trampoline |
+| Q | Toggle Blocks / Tools hotbar |
+| Tab | Select / Tinker mode (Waypoint, Selection) |
+| LCtrl+Z / LCtrl+Y | Undo / redo (up to 100 edits) |
+| - / = | Active tool property |
+| Z / X | Trampoline max height |
+| [ / ] | Fly speed |
+| F / G | Flight / invincibility |
+| Esc | Settings |
 
 ## Editor tools
 
-Press **Q**, then **1-6** to choose a tool. Left click selects or deselects
-objects in Select mode. **Tab** switches Waypoint and Selection to Tinker mode;
-other tools allow selection and editing together.
+Press **Q**, then **1-6**. Left click selects or deselects in Select mode.
 
 | Slot | Tool | Controls |
 | --- | --- | --- |
-| 1 | Waypoint | In Tinker: right click adds a waypoint, left click removes the last; - / = adjusts speed; L toggles loop / back-and-forth motion |
-| 2 | Trampoline | Select blue blocks; - / = adjusts bounce; Z / X adjusts maximum height |
-| 3 | Checkpoint | Select green blocks; - / = turns spawn facing by 15 degrees; Enter uses your look direction |
-| 4 | Grouping | Select at least two blocks, then tap LCtrl to group; tap again on a complete group to ungroup |
+| 1 | Waypoint | Tinker: right click adds, left click removes last; - / = speed; L loop / back-and-forth |
+| 2 | Trampoline | Select blue blocks; - / = bounce; Z / X max height |
+| 3 | Checkpoint | Select green blocks; - / = turn spawn facing 15°; Enter uses look direction |
+| 4 | Grouping | Select 2+ blocks, tap LCtrl to group; tap again on a complete group to ungroup |
 | 5 | Selection | Select blocks, then use the controls below in Tinker mode |
-| 6 | Fill | Right click two corners to fill a box; left click cancels; - / = chooses material or checkers; H toggles Solid / Hollow |
+| 6 | Fill | Right click two corners; left click cancels; - / = material or checkers; H solid / hollow |
 
-Selecting a grouped block selects its group. Trampoline and Checkpoint select
-only matching blocks within that group. Deleting or cutting a group member
-affects the entire group.
+Selecting a grouped block selects the whole group (Trampoline and Checkpoint
+select only matching blocks in it). Deleting or cutting a group member affects
+the whole group. Fill is capped at 32,768 cells.
 
 ### Selection controls
 
 | Key | Action |
 | --- | --- |
-| LCtrl+A / LCtrl+D | Select all / clear in Select mode |
-| Right click | Move the selection pivot to the preview |
-| Arrow keys | Move along world X/Y |
-| Page Up / Page Down | Move vertically |
-| E / T | Rotate horizontally / vertically by 90 degrees |
-| LCtrl+C / LCtrl+X / LCtrl+V | Copy / cut / paste at the preview |
-| Delete | Delete selected objects |
+| LCtrl+A / LCtrl+D | Select all / clear (Select mode) |
+| Right click | Move pivot to preview |
+| Arrows / PgUp / PgDn | Move X/Y / vertically |
+| E / T | Rotate 90° horizontally / vertically |
+| LCtrl+C / X / V | Copy / cut / paste |
+| Delete | Delete selection |
 
-The cyan point marks the selection pivot. **Use Last Selected as Pivot** in
-Settings chooses the last selected block instead of the selection center.
-The last block is also used when the center would put static blocks off-grid.
-Moving paths transform with their blocks. Overlapping or out-of-bounds edits
-are rejected.
+## Files
 
-Fill skips occupied blocks and the player's space. Each box is limited to
-32,768 cells. Map edits, including fills and tool properties, support undo/redo.
-
-## Saves and settings
-
-- Map: `data/map_save.dmf`
+- Map: `data/map_save.dmf` (new maps start from `assets/default_map.dmf`)
 - Settings: `data/settings.json.gz`
-- New maps start from `assets/default_map.dmf`.
 
-Legacy `.txt` and `.dmap` saves migrate automatically. **Convert legacy maps**
-in Settings converts other maps in `data/` to `.dmf`, keeping the originals.
+Legacy `.txt` / `.dmap` saves migrate automatically.
 
-Settings includes sound, particles, previews, shaders, HUD visibility, and
-Discord Rich Presence. Discord desktop must be running with activity sharing
-enabled; activity, block count, elapsed time, and icon can be toggled individually.
-
-The first-launch graphics notice lists detected GPUs and opens Windows graphics
-settings to choose an app GPU. Restart the game after changing the preference.
-
-## Verification
+## Tests
 
 ```sh
 python tests/test_regressions.py
 python tests/benchmark_performance.py
 ```
-
-The regression suite checks physics, editor actions, saves, and migrations.
-The benchmark measures individual CPU workloads rather than overall FPS.
