@@ -3,4 +3,10 @@ if os.name=='nt':user32=ctypes.windll.user32;user32.SetProcessDPIAware();ctypes.
 else:user32=None;_pipe=GraphicsPipeSelection.getGlobalPtr().makeDefaultPipe();w,h=_pipe.getDisplayWidth(),_pipe.getDisplayHeight()
 COLLIDABLE_MASK=BitMask32(1)
 for c in[f'win-size {w} {h-1}'if user32 else f'win-size {w} {h}','fullscreen 0'if user32 else'fullscreen 1','undecorated 1','window-title Disepshun',f'icon-filename {Filename.fromOsSpecific(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"assets","icon.ico"if user32 else"icon.png")).getFullpath()}','sync-video 0','clock-mode normal','show-frame-rate-meter 0','prefer-discrete-gpu 1','depth-bits 24','audio-buffering-seconds 0.02']:loadPrcFileData('',c)
-ROOT_DIR=os.path.dirname(os.path.dirname(os.path.abspath(__file__)));DATA_DIR=os.path.join(ROOT_DIR,'data');SOUND_DIR=os.path.join(ROOT_DIR,'assets','sounds')
+ROOT_DIR=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.name == 'nt':
+    user_data_root = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Local')
+else:
+    user_data_root = os.environ.get('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+DATA_DIR = os.path.join(user_data_root, 'Disepshun')
+SOUND_DIR=os.path.join(ROOT_DIR,'assets','sounds')

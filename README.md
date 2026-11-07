@@ -66,8 +66,14 @@ the whole group. Fill is capped at 32,768 cells.
 
 ## Files
 
-- Map: `data/map_save.dmf` (new maps start from `assets/default_map.dmf`)
-- Settings: `data/settings.json.gz`
+- Map: `%LOCALAPPDATA%\Disepshun\map_save.dmf` on Windows (new maps start from `assets/default_map.dmf`)
+- Settings: `%LOCALAPPDATA%\Disepshun\settings.json.gz` on Windows
+
+Both Python runs and packaged executables use the same save folder.
+On other platforms, saves use `$XDG_DATA_HOME/Disepshun`, defaulting to `~/.local/share/Disepshun`.
+Open `%LOCALAPPDATA%\Disepshun`
+in File Explorer to access these files. Close the game before replacing the map.
+Bundled assets, including the default map, remain inside the executable.
 
 Legacy `.txt` / `.dmap` saves migrate automatically.
 

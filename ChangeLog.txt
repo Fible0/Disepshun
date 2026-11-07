@@ -1,0 +1,68 @@
+Disepshun v1.1.0 - Build Beyond
+*More ways to build, smoother movement, brighter worlds, and faster performance.*
+
+```diff
+ChangeLog
++ Dedicated Waypoint, Trampoline, Checkpoint, Grouping, Selection, and Fill tools.
++ Select and Tinker modes for Waypoint and Selection, with on-screen controls.
++ Group-aware selection, copying, cutting, pasting, deletion, movement, and rotation.
++ Horizontal and vertical 90-degree selection rotation, including moving paths.
++ A shared selection center/pivot marker and a Use Last Selected as Pivot setting.
++ Undo and redo for the last 100 map edits, including tool properties and fills.
++ Solid and hollow box fills, all block materials, and three-axis checkered patterns.
++ Fill limits of 32,768 cells, skipping occupied blocks and the player's space.
++ Checkpoint spawn-facing controls and direction arrows for selected checkpoints.
++ Looping mover paths alongside back-and-forth motion.
++ First-bounce and maximum-bounce previews for selected trampolines.
++ Coyote time for jumping briefly after leaving a ledge.
++ Sound effects for movement, building, tools, menus, settings, and editor actions.
++ Landing sounds that respond to fall height, plus varied sound pitch and volume.
++ Configurable Discord Rich Presence for activity, block count, session time, and icon.
++ A first-launch GPU overview with a shortcut to Windows graphics settings.
++ A bundled default map for new saves.
++ Disepshun application icons.
++ Automated regression checks and repeatable CPU performance benchmarks.
+! Expanded the Tools hotbar to six slots with brief item-name labels.
+! Separated trampoline property editing from ordinary blue-block placement/deletion.
+! Moved crouching and flight descent to either Shift key; Ctrl shortcuts use Left Ctrl.
+! Holding Shift while airborne increases gravity during ascent and descent.
+! Waypoint Tinker uses left click to remove the last waypoint.
+! Grouping uses a standalone Left Ctrl tap; keyboard shortcuts do not trigger grouping.
+! Added consistent magenta tool previews and distinct selection colors per tool.
+! Reworked glowing blocks with shaded faces, smooth bloom halos, and nearby light spill.
+! Added compressed DMF map saves with groups, mover paths, and checkpoint headings.
+! Added automatic legacy-map migration and a batch converter in Settings.
+! Compressed settings storage and kept only values that differ from defaults.
+! Batched rapid placements and checkpoint saves; moved map compression off the game thread.
+! Uncapped rendering by disabling in-game VSync.
+! Optimized collision queries, block picking, nearby glow searches, and large editor overlap checks.
+! Cached mover paths, bloom inputs, and unchanged FPS text.
+! Batched static geometry, culled shared faces, and budgeted edit-time chunk rebuilding.
+! Limited checkpoint particle bursts to a bounded node budget.
+! Split the game into modules and added dependency and launch files for Windows and Linux.
+! Shortened the README around setup, controls, editor tools, saves, and verification.
+~ Fixed existing gameplay and saving issues
+~ Fixed attached moving blocks disappearing, entering the reuse pool, or affecting unrelated movers.
+~ Fixed static and moving block properties being lost on save/reload, including trampoline settings.
+~ Fixed mover and trampoline property edits not saving until another action occurred.
+~ Fixed older save writers overwriting newer snapshots.
+~ Fixed failed saves losing pending changes; retained the previous save and added retries.
+~ Fixed pending map writes being abandoned when exiting.
+~ Fixed God-mode floor collisions away from the floor's center and beyond its edges.
+~ Fixed fast vertical movement passing through blocks.
+~ Fixed riders losing contact with moving platforms during vertical travel, arrivals, and reversals.
+~ Fixed moving platforms pushing players through walls, hazards, or ceilings.
+~ Fixed moving checkpoints restoring the wrong active block or spawn position.
+~ Fixed moving checkpoint colors not updating on activation/deactivation.
+~ Fixed deleted checkpoints retaining their identity when their block nodes were reused.
+~ Fixed hazards failing to trigger when another block was also touched.
+~ Fixed checkpoint seams repeatedly switching or retriggering checkpoints while contact continued.
+~ Fixed crouch-clearance probes triggering lethal contacts without an actual collision.
+~ Fixed waypoint editing depending on whether the block preview was visible.
+~ Fixed waypoint deletion remaining active while gameplay was paused.
+~ Fixed malformed checkpoint records preventing later valid blocks from loading.
+~ Fixed invalid settings values, trampoline numbers, and duplicate block coordinates being accepted.
+~ Fixed rejected mover records leaving scene nodes behind.
+~ Fixed unreadable maps being overwritten and retained backups when loading partially invalid maps.
+~ Fixed closing Settings turning the camera toward the old menu cursor position.
+```
