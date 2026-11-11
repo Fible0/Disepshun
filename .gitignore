@@ -20,3 +20,8 @@ venv/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Build output (publish builds as release assets instead)
+/Disepshun.exe
+/dist/
+/.pyinstaller-build/

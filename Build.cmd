@@ -12,7 +12,8 @@ if exist "%BUILD_DIR%" (
 )
 mkdir "%BUILD_DIR%"
 if errorlevel 1 exit /b 1
-pyinstaller -F -n Disepshun --windowed --noconfirm --optimize 2 --icon "%~dp0assets\icon.ico" --add-data "%~dp0assets;assets" --collect-all panda3d --distpath "%~dp0." --workpath "%BUILD_DIR%\work" --specpath "%BUILD_DIR%" "%~dp0Main.py"
+rem One-folder mode: the game starts without unpacking itself to a temporary folder on every launch.
+pyinstaller -D -n Disepshun --windowed --noconfirm --optimize 2 --icon "%~dp0assets\icon.ico" --add-data "%~dp0assets;assets" --collect-all panda3d --distpath "%~dp0dist" --workpath "%BUILD_DIR%\work" --specpath "%BUILD_DIR%" "%~dp0Main.py"
 set "BUILD_RESULT=%ERRORLEVEL%"
 rem BUILD_DIR is the fixed folder under this script's directory, created above.
 rmdir /s /q "%BUILD_DIR%"
@@ -26,6 +27,6 @@ if exist "%BUILD_DIR%" (
     pause
     exit /b 1
 )
-echo Built "%~dp0Disepshun.exe"
+echo Built "%~dp0dist\Disepshun\Disepshun.exe" (share the whole dist\Disepshun folder)
 pause
 exit /b 0

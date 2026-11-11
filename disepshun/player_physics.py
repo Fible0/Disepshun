@@ -14,6 +14,8 @@ class PlayerPhysics:
         self.curr_h = self.h_stand
         self.head_stand = 1.5; self.head_crouch = 0.8; self.head.setZ(self.head_stand)
         self.vz = 0; self.g = -19.6; self.jump = 8.0; self.ground = False
+        # Faster than any fall inside the map's height at normal gravity, so it only bounds runaway falls.
+        self.max_fall_speed = 300.0; self.lower_bound = -1000.0
         self.bounce_cache = {} # (bounciness, max height, frame time) -> (first, highest) bounce heights
         self.coyote_time = 0.1; self.coyote = 0.0 # Seconds after leaving a ledge that a jump still works
         self.max_step = 0.25 # Largest movement per collision test, well under a block or the player's width
@@ -25,10 +27,6 @@ class PlayerPhysics:
         self.pending_land = None
         self.step_dist = 0.0; self.step_len = 1.6 # Ground distance between footstep sounds
         self.particles = ParticleSystem(self.render)
-        try: self.respawn_sfx = loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, "respawn.mp3")))
-        except: self.respawn_sfx = None
-        try: self.checkpoint_sfx = loader.loadSfx(Filename.fromOsSpecific(os.path.join(SOUND_DIR, "checkpoint.mp3")))
-        except: self.checkpoint_sfx = None
 
     def set_spawn_position(self, position):
         self.player.setPos(position)
@@ -45,11 +43,7 @@ class PlayerPhysics:
         if self.just_respawned: return
         print(f"Respawning at {self.checkpoint}...")
         self.checkpoint_pitch = 1.0
-        if self.respawn_sfx and hasattr(builtins.base, 'sound_enabled') and builtins.base.sound_enabled:
-            self.respawn_sfx.setPlayRate(random.uniform(.95,1.05))
-            self.respawn_sfx.setVolume(random.uniform(.94,1.0))
-            self.respawn_sfx.setTime(.5)
-            self.respawn_sfx.play()
+        builtins.base.play_sfx("respawn", 1.0, 1.0, .5)
         ac = self.world_manager.active_checkpoint_cube
         if ac is not None and not ac.isEmpty() and not ac.getParent().isEmpty():
             self.checkpoint = ac.getPos(self.render) + VBase3(0, 0, 1)
@@ -66,11 +60,8 @@ class PlayerPhysics:
     def activate_checkpoint(self, cube):
         if cube == self.world_manager.active_checkpoint_cube: return False
         if cube is None or cube.isEmpty() or cube.getTag('material') != '4': return False
-        if self.checkpoint_sfx and hasattr(builtins.base, 'sound_enabled') and builtins.base.sound_enabled:
-            self.checkpoint_sfx.setPlayRate(self.checkpoint_pitch)
-            self.checkpoint_sfx.setTime(.3)
-            self.checkpoint_sfx.play()
-            self.checkpoint_pitch += 0.1
+        builtins.base.play_sfx("checkpoint", self.checkpoint_pitch, 1.0, .3)
+        self.checkpoint_pitch += 0.1
 
         old_active = self.world_manager.active_checkpoint_cube
         self.world_manager.active_checkpoint_cube = cube
@@ -95,13 +86,12 @@ class PlayerPhysics:
         min_z = p_pos.z; max_z = p_pos.z + h
         overlaps = lambda cp: (min_x < cp.x+0.5 and max_x > cp.x-0.5 and min_y < cp.y+0.5 and max_y > cp.y-0.5 and min_z < cp.z+0.5 and max_z > cp.z-0.5)
         hits = []
+        wm = self.world_manager
 
-        for mc in self.world_manager.moving_cubes:
-            c = mc['np']
-            if c not in ignore and overlaps(c.getPos(self.render)): hits.append(c)
+        for c, cp in wm.movers_near(min_x, max_x, min_y, max_y, min_z, max_z):
+            if c not in ignore and overlaps(cp): hits.append(c)
 
         floor = False
-        wm = self.world_manager
         if wm.god_floor_enabled:
              gp = wm.god_collision_floor.getPos(self.render); fh = wm.FLOOR_HALF
              if (min_x < gp.x+fh and max_x > gp.x-fh and min_y < gp.y+fh and max_y > gp.y-fh and min_z < gp.z+0.5 and max_z > gp.z-0.5): floor = True
@@ -172,13 +162,14 @@ class PlayerPhysics:
         hgz = -float('inf'); g_cube = None
         check_area = lambda cx, cy, cz, mx, my, mz, hw=0.5: (mx - self.w/2 < cx+hw and mx + self.w/2 > cx-hw and my - self.w/2 < cy+hw and my + self.w/2 > cy-hw and mz < cz+0.5 and mz + self.player_height > cz-0.5)
 
-        def check_obj(c):
+        def check_obj(c, cp=None):
             nonlocal hgz, g_cube
-            cp = c.getPos(self.render)
+            if cp is None: cp = c.getPos(self.render)
             if (cp.x - pp.x)**2 + (cp.y - pp.y)**2 + (cp.z - pp.z)**2 > 9.0: return
             if check_area(cp.x, cp.y, cp.z, pp.x, pp.y, pp.z) and cp.z+0.5 > hgz: hgz = cp.z+0.5; g_cube = c
 
-        for mc in self.world_manager.moving_cubes: check_obj(mc['np'])
+        hw = self.w/2
+        for c, cp in self.world_manager.movers_near(pp.x-hw, pp.x+hw, pp.y-hw, pp.y+hw, pp.z, pp.z+self.player_height): check_obj(c, cp)
         gf = self.world_manager.god_collision_floor
         if self.world_manager.god_floor_enabled:
             cp = gf.getPos(self.render)
@@ -306,10 +297,13 @@ class PlayerPhysics:
                 self.vz = self.jump; self.ground = False; self.coyote = 0.0
                 builtins.base.play_sfx("jump", random.uniform(0.95, 1.05))
             self.vz += self.g * dt * (2.5 if crouching and not self.ground else 1.0)
+            self.vz = max(self.vz, -self.max_fall_speed)
             dz = self.vz * dt; steps = max(1, math.ceil(abs(dz) / self.max_step))
             for _ in range(steps):
                 if self.vertical_step(dz / steps, keys): break
             if self.just_respawned: return
+            # Below the map nothing can stop a fall (invincibility skips the -20 respawn), so return to the checkpoint.
+            if self.player.getZ() < self.lower_bound: self.respawn(); return
             self.coyote = self.coyote_time if self.ground else max(0.0, self.coyote - dt)
 
             sp = 2.0 if crouching else 5.0

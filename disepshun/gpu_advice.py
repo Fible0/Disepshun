@@ -1,4 +1,4 @@
-"""Compare the active renderer with Windows' power/performance adapter ordering."""
+"""List the active renderer alongside Windows' power/performance adapter ordering."""
 import ctypes
 import os
 import re
@@ -9,23 +9,6 @@ import uuid
 def _normalized(name):
     name = re.sub(r'\((?:r|tm)\)', '', name.casefold())
     return re.sub(r'[^a-z0-9]', '', name)
-
-
-def gpu_recommendation(renderer, power_order, performance_order):
-    """Only advise when the renderer matches a known lower-priority adapter."""
-    if not renderer or not power_order or not performance_order:
-        return None
-    current = _normalized(renderer)
-    def matches(name):
-        other = _normalized(name)
-        return len(other) >= 8 and (other in current or current in other)
-    best = performance_order[0]
-    if matches(best['name']):
-        return None
-    for adapter in power_order:
-        if matches(adapter['name']) and adapter['id'] != best['id']:
-            return dict(current=renderer, recommended=best['name'])
-    return None
 
 
 def windows_adapter_orders():
@@ -80,10 +63,6 @@ def windows_adapter_orders():
         return [], []
     finally:
         release(factory)
-
-
-def check_renderer(renderer):
-    return gpu_recommendation(renderer,*windows_adapter_orders())
 
 
 def executable_path():

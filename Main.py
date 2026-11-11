@@ -76,7 +76,6 @@ class Disepshun(EditorTools, ShowBase):
         
         self.world.load_map()
         
-        self.world.sky.reparentTo(self.camera)
         if self.world.saved_checkpoint_pos:
             self.physics.checkpoint = self.world.saved_checkpoint_pos + VBase3(0, 0, 1)
             self.physics.set_spawn_position(self.physics.checkpoint)
@@ -99,7 +98,7 @@ class Disepshun(EditorTools, ShowBase):
         "Discord Show Time", "Discord Show Icon"], True)
     DEFAULT_SETTINGS.update(dict.fromkeys([
         "Visual Floor", "Use Last Selected as Pivot", "GPU Notice Shown",
-        "Hide Low Power GPU Warning"], False))
+        "Cap Frame Rate"], False))
     BOOL_SETTINGS = list(DEFAULT_SETTINGS) + ["Relative Waypoints"]
 
     def load_settings(self):
@@ -185,16 +184,12 @@ class Disepshun(EditorTools, ShowBase):
         # first off-centre reading and re-centre instead of turning the camera with it.
         self.ignore_mouse_input = True
 
-    CUBE_FACES = [((0, -0.5, 0), 180, 0), ((0, 0.5, 0), 0, 0), ((-0.5, 0, 0), -90, 0), ((0.5, 0, 0), 90, 0), ((0, 0, 0.5), 0, -90), ((0, 0, -0.5), 0, 90)]
     GHOST_FIRST = (1, 0.7, 0.15); GHOST_MAX = (0.7, 0.35, 1) # Amber: first bounce, violet: highest bounce
 
     def create_preview(self):
         self.preview = NodePath("preview")
         self.preview.reparentTo(self.render)
-
-        for pos, h, p in self.CUBE_FACES:
-            f = self.world.face_node.copyTo(self.preview)
-            f.setPos(pos); f.setHpr(h, p, 0); f.setTwoSided(True)
+        self.world.cube_geom.copyTo(self.preview).setTwoSided(True)
             
         self.preview.setTransparency(TransparencyAttrib.MAlpha)
         self.preview.setColorScale(1, 1, 1, 0.5)
@@ -207,9 +202,7 @@ class Disepshun(EditorTools, ShowBase):
         w = self.physics.w; h = self.physics.h_stand / 2
         g = self.render.attachNewNode("bounce_ghost")
         body = g.attachNewNode("body"); body.setScale(w, w, h); body.setZ(h / 2)
-        for pos, hh, p in self.CUBE_FACES:
-            f = self.world.face_node.copyTo(body)
-            f.setPos(pos); f.setHpr(hh, p, 0); f.setTwoSided(True)
+        self.world.cube_geom.copyTo(body).setTwoSided(True)
         body.setColor(*color, 0.25); body.setDepthWrite(False)
         ls = LineSegs(); ls.setColor(*color, 0.85); ls.setThickness(2.0)
         x, y = w / 2, w / 2
@@ -223,7 +216,7 @@ class Disepshun(EditorTools, ShowBase):
 
     def update_bounce_ghosts(self):
         ts = [t for t in self.selected_trampolines if not t.isEmpty()] if self.tool_mode == 8 else []
-        fps = globalClock.getAverageFrameRate(); dt = 1 / round(fps) if fps >= 1 else 1 / 60
+        dt = self.PHYSICS_STEP # Physics runs on a fixed step, so bounces are the same at any frame rate
         while len(self.bounce_ghosts) < len(ts): self.bounce_ghosts.append((self.make_ghost(self.GHOST_FIRST), self.make_ghost(self.GHOST_MAX)))
         for i, (first, top) in enumerate(self.bounce_ghosts):
             if i >= len(ts): first.hide(); top.hide(); continue
@@ -235,11 +228,22 @@ class Disepshun(EditorTools, ShowBase):
             if mh - fh > 0.01: top.show()
             else: top.hide()
 
+    PICK_FAR = 1000.0 # Camera far plane: selection and deletion reach anything visible
+
     def setup_ray(self):
         self.cTrav = CollisionTraverser(); self.cHandler = CollisionHandlerQueue()
-        r = CollisionRay(); r.setFromLens(self.camNode, 0, 0)
-        n = CollisionNode('mRay'); n.addSolid(r); n.setFromCollideMask(COLLIDABLE_MASK)
+        # A segment along the view axis; its length is set per query, so build previews skip distant blocks.
+        self.pick_segment = CollisionSegment(0, 0, 0, 0, self.PICK_FAR, 0)
+        n = CollisionNode('mRay'); n.addSolid(self.pick_segment); n.setFromCollideMask(COLLIDABLE_MASK)
         self.picker = self.camera.attachNewNode(n); self.cTrav.addCollider(self.picker, self.cHandler)
+
+    def traverse_pick(self, length=None):
+        """Collect blocks hit along the view axis, up to length (the camera far plane by default)."""
+        segment = getattr(self, 'pick_segment', None)
+        if segment is not None:
+            length = self.PICK_FAR if length is None else float(length)
+            if segment.getPointB().y != length: segment.setPointB(0, length, 0)
+        self.cTrav.traverse(self.render)
 
     def setup_input(self):
         def bind_action(event, callback, args=None):
@@ -331,7 +335,8 @@ class Disepshun(EditorTools, ShowBase):
         if not self.menu_open: self.center_mouse()
 
     def check_startup_gpu(self):
-        if self.saved_settings.get('GPU Notice Shown',False): return
+        # The notice explains Windows' per-app GPU setting; other platforms have no equivalent to point to.
+        if os.name != 'nt' or self.saved_settings.get('GPU Notice Shown',False): return
         gsg = self.win.getGsg()
         if gsg is None: return
         from disepshun.gpu_advice import renderer_info
@@ -390,14 +395,16 @@ class Disepshun(EditorTools, ShowBase):
     def toggle_sound(self, v): 
         self.sound_enabled = v
 
-    def play_sfx(self, name, rate=1.0, volume=1.0):
+    def play_sfx(self, name, rate=1.0, volume=1.0, start=0.0):
         s = self.sfx.get(name)
         if not s or not self.sound_enabled: return
         # Preserve checkpoint playback; other cues vary subtly on every play.
         if name != 'checkpoint':
             rate *= random.uniform(.95,1.05)
             volume *= random.uniform(.94,1.0)
-        s.stop(); s.setPlayRate(rate); s.setVolume(volume); s.play()
+        s.stop(); s.setPlayRate(rate); s.setVolume(volume)
+        if start: s.setTime(start)
+        s.play()
 
     def play_block_action(self, right_click):
         self.play_sfx('place' if right_click else 'break', random.uniform(.95,1.05))
@@ -488,13 +495,13 @@ class Disepshun(EditorTools, ShowBase):
             token=self.begin_edit(nodes); self.ensure_selected_movers()
             for m in self.selected_movers: m['speed']=min(1000.0,max(.5,round(m['speed']+d*.5,1)))
             self.finish_edit(token,[m['np'] for m in self.selected_movers],'mover_speed')
-            self.update_hud(); self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment(d)
+            self.update_hud(); self.world.touch(); self.world.queue_save(); self.play_adjustment(d)
         elif self.tool_mode==8 and self.selected_trampolines:
             token=self.begin_edit(self.selected_trampolines)
             self.cur_bounce=min(100,max(.1,round(self.cur_bounce+d*.1,1)))
             for t in self.selected_trampolines: t.setTag('bounciness',str(self.cur_bounce))
             self.finish_edit(token,self.selected_trampolines,'trampoline_bounce')
-            self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment(d); self.update_hud()
+            self.world.queue_save(); self.play_adjustment(d); self.update_hud()
 
     def adj_h(self, d):
         if not self.tinkering(): return
@@ -503,7 +510,7 @@ class Disepshun(EditorTools, ShowBase):
             self.cur_h=min(10000,max(0,round(self.cur_h+d*.5,1)))
             for t in self.selected_trampolines: t.setTag('max_height',str(self.cur_h))
             self.finish_edit(token,self.selected_trampolines,'trampoline_height')
-            self.world.map_is_dirty=True; self.world.save_map(); self.play_adjustment(d); self.update_hud()
+            self.world.queue_save(); self.play_adjustment(d); self.update_hud()
 
     def adj_fly(self, d):
         previous = self.physics.fly_speed
@@ -511,9 +518,6 @@ class Disepshun(EditorTools, ShowBase):
         if self.physics.fly_speed != previous: self.play_adjustment(self.physics.fly_speed-previous)
         if not self.ui.gui_hidden and self.fly_text_enabled:
             self.ui.fly_text.setText(f"Fly Speed: {self.ui.format_number(self.physics.fly_speed)}"); self.ui.fly_text.show(); self.ui.fly_text.setAlphaScale(1.0); self.fly_text_timer = 3.0
-
-    def handle_sel(self, mode):
-        if mode == 7: return self.select_object()
 
     def handle_place_wp(self):
         if not self.tinkering() or self.tool_mode != 7: return
@@ -529,7 +533,7 @@ class Disepshun(EditorTools, ShowBase):
             off = pos - ref
             for m in self.selected_movers: m['waypoints'].append(m['origin'] + off)
             self.finish_edit(token,[m['np'] for m in self.selected_movers],'waypoint_add')
-            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map(); self.play_block_action(True)
+            self.draw_wp(); self.world.touch(); self.world.queue_save(); self.play_block_action(True)
 
     def deselect_movers(self):
         for m in self.selected_movers: m['np'].clearColorScale()
@@ -549,7 +553,7 @@ class Disepshun(EditorTools, ShowBase):
                 if m['waypoints']: 
                     m['waypoints'].pop()
             self.finish_edit(token,[m['np'] for m in self.selected_movers],'waypoint_remove')
-            self.draw_wp(); self.world.map_is_dirty = True; self.world.save_map(); self.play_block_action(False)
+            self.draw_wp(); self.world.touch(); self.world.queue_save(); self.play_block_action(False)
 
     def toggle_mover_loop(self):
         if self.tool_mode != 7 or not self.tinkering(): return
@@ -563,7 +567,7 @@ class Disepshun(EditorTools, ShowBase):
             m['direction'] = 1
         self.finish_edit(token, [m['np'] for m in self.selected_movers], 'waypoint_loop')
         self.play_sfx('toggle',1.12 if loop else .88)
-        self.world.map_is_dirty = True; self.world.save_map()
+        self.world.touch(); self.world.queue_save()
         self.draw_wp(); self.update_hud()
 
     def draw_wp(self):
@@ -626,6 +630,47 @@ class Disepshun(EditorTools, ShowBase):
             elif t >= self.repeats[k]: f(1 if k in ["plus","br_r","x"] else -1); self.repeats[k] = t + 0.1
         else: self.timers[k] = 0
 
+    PHYSICS_STEP = 1/240 # Fixed player-physics step: jump and bounce heights do not depend on frame rate
+    MAX_PHYSICS_STEPS = 24 # At most 0.1 s of simulation per frame, as before
+    PAUSED_FPS = 60; UNFOCUSED_FPS = 20
+
+    def display_refresh_rate(self):
+        try:
+            info = self.pipe.getDisplayInformation(); mode = info.getCurrentDisplayModeIndex()
+            rate = info.getDisplayModeRefreshRate(mode) if mode >= 0 else 0
+        except Exception: rate = 0
+        return rate if 24 <= rate <= 1000 else 144
+
+    def apply_frame_limit(self):
+        """Render at most the refresh rate when capped, and slower while paused or in the background."""
+        if not self.is_focused: limit = self.UNFOCUSED_FPS
+        elif self.paused: limit = self.PAUSED_FPS
+        elif self.saved_settings.get('Cap Frame Rate', False):
+            if getattr(self, 'refresh_rate', None) is None: self.refresh_rate = self.display_refresh_rate()
+            limit = self.refresh_rate
+        else: limit = 0
+        if limit == getattr(self, 'frame_limit', None): return
+        self.frame_limit = limit
+        clock = ClockObject.getGlobalClock()
+        if limit: clock.setMode(ClockObject.MLimited); clock.setFrameRate(limit)
+        else: clock.setMode(ClockObject.MNormal)
+
+    def step_physics(self, dt):
+        """Advance player physics in fixed steps; leftover time carries into the next frame."""
+        step = self.PHYSICS_STEP
+        self.physics_time = min(getattr(self, 'physics_time', 0.0) + dt, step * self.MAX_PHYSICS_STEPS)
+        while self.physics_time >= step:
+            self.physics_time -= step
+            self.physics.update(step, self.keyMap)
+
+    def report_save_state(self, t):
+        # Runs while paused or in the background too, so a queued or failed save is not held back.
+        self.world.retry_save(t)
+        if self.world.save_error != self.shown_save_error:
+            self.shown_save_error = self.world.save_error
+            if self.shown_save_error:
+                self.ui.fly_text.setText(self.shown_save_error); self.ui.fly_text.show(); self.ui.fly_text.setAlphaScale(1.0); self.fly_text_timer = 5.0
+
     def update(self, task):
         filters=getattr(self,'glow_filters',None)
         if filters is not None: filters.update()
@@ -641,8 +686,10 @@ class Disepshun(EditorTools, ShowBase):
                 self.center_mouse()
                 self.ignore_mouse_input = True
         
-        if not foc: return task.cont
+        self.apply_frame_limit()
         dt = globalClock.getDt(); t = globalClock.getFrameTime()
+        self.report_save_state(t)
+        if not foc: return task.cont
         self.ui.update_item_name(dt)
         self.ui.update_presence_status()
         fps = round(globalClock.getAverageFrameRate())
@@ -683,28 +730,22 @@ class Disepshun(EditorTools, ShowBase):
                     self.camera.setP(max(-89, min(89, self.camera.getP() - (y - cy) * 0.1 * self.mouse_sensitivity)))
                     self.win.movePointer(0, cx, cy)
 
-        self.physics.update(dt, self.keyMap)
+        self.step_physics(dt)
         if not self.physics.god_mode and self.physics.player.getZ() < -20: self.physics.respawn()
+        self.world.mover_index = None # Built for this frame's positions; later edits must not use it
 
         if ((self.tool_mode in (7, 11, 12) and self.tinkering()) or self.build_material != 0):
-            self.cTrav.traverse(self.render)
+            self.traverse_pick(self.build_dist)
             pl = VBase3(); ok = False
             if self.cHandler.getNumEntries() > 0:
                 self.cHandler.sortEntries(); e = self.cHandler.getEntry(0); hp = e.getSurfacePoint(self.render)
                 if (hp - self.camera.getPos(self.render)).length() <= self.build_dist:
                     p = e.getIntoNodePath().getParent()
-                    if p.hasTag("material") or p == self.world.god_collision_floor or p.getName().startswith("chunk_") or p in self.world.cubes or any(mc['np'] == p for mc in self.world.moving_cubes):
+                    if p.hasTag("material") or p == self.world.god_collision_floor:
                         if p == self.world.god_collision_floor: pl.set(round(hp.x), round(hp.y), -19.5)
                         else:
                             n = e.getSurfaceNormal(self.render)
-                            if p.hasTag("material") or p in self.world.cubes:
-                                cp = p.getPos(self.render)
-                            elif any(mc['np'] == p for mc in self.world.moving_cubes):
-                                cp = p.getPos(self.render)
-                            else: 
-                                center = hp - n * 0.5
-                                cp = VBase3(math.floor(center.x + 0.5), math.floor(center.y + 0.5), math.floor(center.z + 0.5) - 0.5)
-
+                            cp = p.getPos(self.render)
                             an = VBase3(abs(n.x), abs(n.y), abs(n.z))
                             if an.x > an.y and an.x > an.z: pl = cp + VBase3(round(n.x), 0, 0)
                             elif an.y > an.x and an.y > an.z: pl = cp + VBase3(0, round(n.y), 0)
@@ -725,26 +766,21 @@ class Disepshun(EditorTools, ShowBase):
         else: 
             self.preview.hide()
 
-        self.refresh_object_selection()
+        self.refresh_selection_if_changed()
         self.draw_checkpoint_direction()
         self.update_bounce_ghosts()
         self.world.update_chunks(budget_seconds=.0025)
         self.world.update_glow_lights(self.camera.getPos(self.render))
-        self.world.retry_save(t)
-        if self.world.save_error != self.shown_save_error:
-            self.shown_save_error = self.world.save_error
-            if self.shown_save_error:
-                self.ui.fly_text.setText(self.shown_save_error); self.ui.fly_text.show(); self.ui.fly_text.setAlphaScale(1.0); self.fly_text_timer = 5.0
         return task.cont
 
     def update_world(self, task):
         if self.paused or (self.is_focused is not None and not self.is_focused): return task.cont
         dt = globalClock.getDt()
-        carry = None; carry_top = -float('inf'); moved = {}
+        carry = None; carry_top = -float('inf'); moved = {}; positions = []
         pp = self.physics.player.getPos()
         for m in self.world.moving_cubes:
             pts, circuit = self.world.mover_path(m)
-            if not pts: continue
+            if not pts: positions.append(m['np'].getPos()); continue
             
             m['current_idx'] %= len(pts)
             curr = m['np'].getPos()
@@ -774,8 +810,12 @@ class Disepshun(EditorTools, ShowBase):
                     m['current_idx'] = nxt
                 if remaining <= 0: break
             m['np'].setPos(pos)
-            moved[id(m)] = m['np'].getPos() - curr
+            new = m['np'].getPos(); positions.append(new)
+            moved[id(m)] = new - curr
 
+        # Collision queries until the end of this frame look up movers by cell instead of scanning them all.
+        # Movers sit directly under the untransformed platform holder, so local positions are world positions.
+        self.world.index_movers(positions)
         if carry is not None:
             move = moved[id(carry)]
             if move.lengthSquared() > 0:
@@ -804,9 +844,10 @@ class Disepshun(EditorTools, ShowBase):
             if abs(mp.x - pos.x) < 0.99 and abs(mp.y - pos.y) < 0.99 and abs(mp.z - pos.z) < 0.99:
                 return
 
-        # Find the targeted block before adding the new one, so the ray can't hit the new block
+        # Find the targeted block before adding the new one, so the ray can't hit the new block.
+        # Only a hit within build range is the block the preview is against.
         target = None
-        self.cTrav.traverse(self.render)
+        self.traverse_pick(self.build_dist)
         if self.cHandler.getNumEntries() > 0:
             self.cHandler.sortEntries(); target = self.world.find_mover(self.cHandler.getEntry(0).getIntoNodePath().getParent())
 
@@ -831,6 +872,7 @@ class Disepshun(EditorTools, ShowBase):
             self.world.cubes.append(c); self.world.cube_map[k] = c
             self.world.register_cube(c)
             self.world.request_chunk_update(pos)
+            self.world.touch()
         self.finish_edit(token,[c],'place')
         self.world.queue_save()
         self.play_block_action(True)
@@ -844,26 +886,41 @@ class Disepshun(EditorTools, ShowBase):
         if self.tool_mode == 12:
             self.cancel_fill(); return
         if self.tool_mode == 7:
-            return self.undo_wp() if self.tinkering() else self.handle_sel(7)
+            return self.undo_wp() if self.tinkering() else self.select_object()
         elif self.tool_mode in (8, 9, 10, 11): return self.select_object()
-        self.cTrav.traverse(self.render)
+        self.traverse_pick()
         if self.cHandler.getNumEntries() > 0:
-            self.cHandler.sortEntries(); np = self.cHandler.getEntry(0).getIntoNodePath(); p = np.getParent()
-            
-            target = p
-            if p.getName().startswith("chunk_"):
-                hp = self.cHandler.getEntry(0).getSurfacePoint(self.render)
-                n = self.cHandler.getEntry(0).getSurfaceNormal(self.render)
-                center = hp - n * 0.5
-                k = self.world.get_grid_key(center)
-                if k in self.world.cube_map:
-                    target = self.world.cube_map[k]
-
+            self.cHandler.sortEntries(); target = self.cHandler.getEntry(0).getIntoNodePath().getParent()
             if self.delete_objects([target]):
-                self.world.map_is_dirty=True; self.world.save_map()
+                self.world.queue_save()
                 self.play_block_action(False)
 
-try:
-    app = Disepshun()
-    app.run()
-except Exception: traceback.print_exc()
+
+def write_crash_log(text):
+    """The packaged build has no console, so keep the traceback where players can find it."""
+    path = os.path.join(DATA_DIR, 'crash.log')
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(f"--- {__import__('time').strftime('%Y-%m-%d %H:%M:%S')} ---\n{text}\n")
+        return path
+    except OSError:
+        return None
+
+
+def main():
+    import builtins
+    try:
+        Disepshun().run()
+    except Exception:
+        text = traceback.format_exc(); print(text, end='')
+        path = write_crash_log(text)
+        if path: print(f"Crash details written to {path}")
+    finally:
+        # Write any edit still waiting in the save debounce or marked for retry.
+        world = getattr(getattr(builtins, 'base', None), 'world', None)
+        if world is not None: world.flush_saves()
+
+
+if __name__ == '__main__':
+    main()

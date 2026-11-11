@@ -1,10 +1,79 @@
 from disepshun.config import *
 from panda3d.core import Shader, DirectionalLight, AmbientLight, CompassEffect, NodePath, PointLight, Material, VBase4
 import builtins
-from collections import defaultdict
 import math
 import shutil
 import time
+
+
+class NodeList:
+    """Insertion-ordered set of block nodes with the list operations the game uses.
+    Membership and removal are O(1); the map keeps its save order."""
+    __slots__ = ('_items', '_seq')
+
+    def __init__(self, items=()):
+        self._items = dict.fromkeys(items); self._seq = None
+
+    def _sequence(self):
+        if self._seq is None: self._seq = tuple(self._items)
+        return self._seq
+
+    def append(self, node): self._items[node] = None; self._seq = None
+    def extend(self, nodes):
+        for node in nodes: self.append(node)
+
+    def remove(self, node):
+        try: del self._items[node]
+        except KeyError: raise ValueError('node not in list') from None
+        self._seq = None
+
+    def __contains__(self, node): return node in self._items
+    def __iter__(self): return iter(self._sequence())  # A snapshot, so removal while iterating is safe
+    def __len__(self): return len(self._items)
+    def __bool__(self): return bool(self._items)
+    def __getitem__(self, index):
+        seq = self._sequence()
+        return list(seq[index]) if isinstance(index, slice) else seq[index]
+    def __eq__(self, other):
+        if isinstance(other, (list, tuple, NodeList)): return list(self) == list(other)
+        return NotImplemented
+    __hash__ = None
+    def __repr__(self): return f'NodeList({list(self)!r})'
+
+
+class MoverList:
+    """Moving-block records in map order, indexed by node so lookups and removals are O(1)."""
+    __slots__ = ('_by_node', '_seq')
+
+    def __init__(self, movers=()):
+        self._by_node = {}; self._seq = None
+        for m in movers: self.append(m)
+
+    def _sequence(self):
+        if self._seq is None: self._seq = tuple(self._by_node.values())
+        return self._seq
+
+    def append(self, mover): self._by_node[mover['np']] = mover; self._seq = None
+
+    def remove(self, mover):
+        if self._by_node.get(mover['np']) is not mover: raise ValueError('mover not in list')
+        del self._by_node[mover['np']]; self._seq = None
+
+    def find(self, node): return self._by_node.get(node)
+    def __contains__(self, mover):
+        return isinstance(mover, dict) and self._by_node.get(mover.get('np')) is mover
+    def __iter__(self): return iter(self._sequence())
+    def __len__(self): return len(self._by_node)
+    def __bool__(self): return bool(self._by_node)
+    def __getitem__(self, index):
+        seq = self._sequence()
+        return list(seq[index]) if isinstance(index, slice) else seq[index]
+    def __eq__(self, other):
+        if isinstance(other, (list, tuple, MoverList)): return list(self) == list(other)
+        return NotImplemented
+    __hash__ = None
+    def __repr__(self): return f'MoverList({list(self)!r})'
+
 
 class WorldManager:
     FLOOR_HALF = 1000 # God floor half-size, shared by visuals, ray picking and player physics
@@ -14,9 +83,11 @@ class WorldManager:
     def __init__(self, render, loader):
         self.render = render
         self.loader = loader
-        self.cubes = [] # Logical nodes (Collision only)
-        self.cube_map = {} 
-        self.moving_cubes = []
+        self.cubes = NodeList() # Static block nodes (collision only), in save order
+        self.cube_map = {}
+        self.moving_cubes = MoverList()
+        self.block_version = 0 # Bumped whenever blocks are added, removed, converted or edited
+        self.mover_index = None # Movers bucketed by cell for this frame's collision queries
         self.save_file = os.path.join(DATA_DIR, "map_save.dmf")
         self.default_map_file = os.path.join(ROOT_DIR, "assets", "default_map.dmf")
         self.map_is_dirty = False
@@ -37,10 +108,11 @@ class WorldManager:
         self.chunks_visual = {}
         self.collision_chunks = {}
         self.chunk_format = GeomVertexFormat.getV3n3t2()
-        self.chunk_contents = defaultdict(list) 
+        self.chunk_contents = {} # Chunk key -> insertion-ordered {block node: None}
         self.static_cube_order = {}
         self.next_cube_order = 0
         self.dirty_chunks = set()
+        self.empty_chunks = set() # Chunks whose last block left; their collider holders are pruned next frame
         self.god_floor_enabled = False
         
         cm = CardMaker('face')
@@ -51,7 +123,9 @@ class WorldManager:
         self.face_node = NodePath(cm.generate())
         # Optimization: Backface Culling (Hides inside of blocks)
         self.face_node.setTwoSided(False)
-        
+        # One 24-vertex cube shared by every mover, preview and ghost: one draw call each.
+        self.cube_geom = self.make_cube_geom()
+
         # Emission keeps the neon visible; diffuse lighting gives each face depth.
         self.red_glow_mat = self.make_glow_material((1,0,0,1))
         self.lime_glow_mat = self.make_glow_material((0,1,0,1))
@@ -67,7 +141,6 @@ class WorldManager:
         self.glow_lights = []; self.glow_sources = []; self.next_glow_scan = 0.0
         self.shaders_enabled = True
         self.setup_lights()
-        self.create_sky()
         self.create_boundary_objects()
         self.create_platform()
 
@@ -144,13 +217,6 @@ class WorldManager:
             self.render.clearShader()
             self.render.setLightOff(1)
 
-    def create_sky(self):
-        self.sky = self.loader.loadModel("models/misc/sphere")
-        self.sky.reparentTo(self.render); self.sky.setScale(1)
-        self.sky.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullCounterClockwise))
-        self.sky.setBin("background", 10); self.sky.setDepthTest(False); self.sky.setDepthWrite(False); self.sky.setLightOff()
-        self.sky.setColorScale((0, 0, 0, 1))
-
     def create_boundary_objects(self):
         cm = CardMaker("visual_floor"); cm.setFrame(-self.FLOOR_HALF, self.FLOOR_HALF, -self.FLOOR_HALF, self.FLOOR_HALF)
         self.visual_floor = self.render.attachNewNode(cm.generate())
@@ -179,6 +245,7 @@ class WorldManager:
         if ly == self.chunk_size - 1: self.dirty_chunks.add((key[0], key[1]+1))
 
     def update_chunks(self, budget_seconds=None):
+        if self.empty_chunks: self.prune_chunks()
         if not self.dirty_chunks: return
         started=time.perf_counter()
         for key in list(self.dirty_chunks):
@@ -195,6 +262,23 @@ class WorldManager:
         ((0,0,1), ((-.5,-.5,.5),(.5,-.5,.5),(.5,.5,.5),(-.5,.5,.5))),
         ((0,0,-1), ((-.5,.5,-.5),(.5,.5,-.5),(.5,-.5,-.5),(-.5,-.5,-.5))),
     )
+
+    def make_cube_geom(self):
+        """A unit cube centred on its origin, with outward normals and per-face UVs."""
+        from array import array
+        vertices = array('f'); indices = array('I')
+        for (nx,ny,nz),corners in self.FACE_DATA:
+            first = len(vertices)//8
+            for (dx,dy,dz),(u,v) in zip(corners,((0,0),(1,0),(1,1),(0,1))):
+                vertices.extend((dx,dy,dz,nx,ny,nz,u,v))
+            indices.extend((first,first+1,first+2,first,first+2,first+3))
+        data = GeomVertexData('cube_faces',self.chunk_format,Geom.UHStatic)
+        data.modifyArray(0).modifyHandle().setData(vertices.tobytes())
+        triangles = GeomTriangles(Geom.UHStatic); triangles.setIndexType(Geom.NTUint32)
+        triangles.modifyVertices().modifyHandle().setData(indices.tobytes())
+        geom = Geom(data); geom.addPrimitive(triangles)
+        node = GeomNode('cube'); node.addGeom(geom)
+        return NodePath(node)
 
     def rebuild_chunk(self, key):
         from array import array
@@ -236,7 +320,7 @@ class WorldManager:
 
     def register_cube(self, cube):
         key=self.get_chunk_key(cube.getPos())
-        self.chunk_contents[key].append(cube)
+        self.chunk_contents.setdefault(key, {})[cube] = None
         if cube not in self.static_cube_order:
             self.static_cube_order[cube] = self.next_cube_order
             self.next_cube_order += 1
@@ -247,8 +331,21 @@ class WorldManager:
 
     def unregister_cube(self, cube):
         k = self.get_chunk_key(cube.getPos())
-        if cube in self.chunk_contents[k]:
-            self.chunk_contents[k].remove(cube)
+        contents = self.chunk_contents.get(k)
+        if contents is None or cube not in contents: return
+        del contents[cube]
+        if contents: return
+        # Drop empty chunk bookkeeping so long sessions do not accumulate it. The collider holder may
+        # still parent blocks mid-edit, so it is removed by prune_chunks once the edit has moved them.
+        del self.chunk_contents[k]
+        self.empty_chunks.add(k)
+
+    def prune_chunks(self):
+        for k in self.empty_chunks:
+            holder = self.collision_chunks.get(k)
+            if k not in self.chunk_contents and holder is not None and holder.getNumChildren() == 0:
+                del self.collision_chunks[k]; holder.removeNode()
+        self.empty_chunks.clear()
 
     def get_cube(self, name):
         while self.cube_pool:
@@ -330,9 +427,44 @@ class WorldManager:
         f.setColor(*color)
 
     def find_mover(self, np):
-        for mc in self.moving_cubes:
-            if mc['np'] == np: return mc
-        return None
+        movers = self.moving_cubes
+        if isinstance(movers, MoverList): return movers.find(np)
+        return next((mc for mc in movers if mc['np'] == np), None)
+
+    def touch(self):
+        """Record that blocks were added, removed or edited: selection caches and the mover index refresh."""
+        self.block_version += 1
+        self.mover_index = None
+
+    def index_movers(self, positions=None):
+        """Bucket mover positions (in map order; read now when not given) by cell, for this frame's collision queries."""
+        if positions is None: positions = [m['np'].getPos(self.render) for m in self.moving_cubes]
+        cells = {}; floor = math.floor
+        for i, (m, p) in enumerate(zip(self.moving_cubes, positions)):
+            try: key = (floor(p.x), floor(p.y), floor(p.z))
+            except (OverflowError, ValueError): self.mover_index = None; return
+            if (bucket := cells.get(key)) is None: cells[key] = [(i, m['np'], p)]
+            else: bucket.append((i, m['np'], p))
+        self.mover_index = (self.block_version, len(self.moving_cubes), cells)
+
+    def movers_near(self, min_x, max_x, min_y, max_y, min_z, max_z):
+        """(node, position) of movers whose unit cube can overlap the box, in map order."""
+        index = self.mover_index
+        if index is not None and index[0] == self.block_version and index[1] == len(self.moving_cubes):
+            try:
+                xs = range(math.floor(min_x-.5), math.floor(max_x+.5)+1)
+                ys = range(math.floor(min_y-.5), math.floor(max_y+.5)+1)
+                zs = range(math.floor(min_z-.5), math.floor(max_z+.5)+1)
+            except (OverflowError, ValueError): xs = ys = zs = None
+            if xs is not None and len(xs)*len(ys)*len(zs) <= 512:
+                cells = index[2]; found = []
+                for x in xs:
+                    for y in ys:
+                        for z in zs:
+                            if (bucket := cells.get((x, y, z))): found.extend(bucket)
+                if len(found) > 1: found.sort(key=lambda item: item[0])
+                return [(node, p) for _, node, p in found]
+        return [(m['np'], m['np'].getPos(self.render)) for m in self.moving_cubes]
 
     @staticmethod
     def mover_path(m):
@@ -352,14 +484,10 @@ class WorldManager:
         if self.find_mover(cube):
             geom = cube.find("face_geom")
             if geom.isEmpty():
-                geom = NodePath("face_geom")
-                face_data = [((0, -0.5, 0), 0, 0), ((0, 0.5, 0), 180, 0), ((-0.5, 0, 0), -90, 0), ((0.5, 0, 0), 90, 0), ((0, 0, 0.5), 0, -90), ((0, 0, -0.5), 0, 90)]
-                for pos, h, p in face_data:
-                    f = self.face_node.copyTo(geom)
-                    f.setPos(pos); f.setHpr(h, p, 0); f.setTwoSided(False)
-                geom.reparentTo(cube)
+                # The copy shares the cube's vertex data; only the node and its style are per mover.
+                geom = self.cube_geom.copyTo(cube); geom.setName("face_geom")
             # Restyle existing faces too, so checkpoint activation changes mover colors
-            for f in geom.getChildren(): self.style_face(f, cube)
+            self.style_face(geom, cube)
             return
 
         self.request_chunk_update(cube.getPos())
@@ -376,6 +504,7 @@ class WorldManager:
         if c.getParent() != self.platform_holder: c.reparentTo(self.platform_holder)
         mover['np'] = c
         self.moving_cubes.append(mover)
+        self.touch()
         self.update_cube_faces(c)
         return mover
 
@@ -392,10 +521,8 @@ class WorldManager:
         else: return False
         if np == self.active_checkpoint_cube: self.active_checkpoint_cube = None
         self.recycle_cube(np)
+        self.touch()
         return True
-
-    def update_neighbor_visibility(self, key):
-        pass
 
     def create_platform(self):
         self.platform_holder = self.render.attachNewNode("PlatformHolder")
@@ -405,14 +532,15 @@ class WorldManager:
         self.chunks_visual.clear()
         self.collision_chunks.clear()
         
-        self.cubes = []; self.cube_map = {}; self.moving_cubes = []
-        self.god_floor_enabled = False
+        self.cubes = NodeList(); self.cube_map = {}; self.moving_cubes = MoverList()
+        self.god_floor_enabled = False; self.touch()
         
         self.update_chunks()
 
     def _threaded_save(self, data, gen):
         with self.save_lock:
-            if gen <= self.committed_gen: return # A newer snapshot is already on disk
+            # A newer snapshot is already on disk, or queued behind this one and will be written anyway
+            if gen <= self.committed_gen or gen < self.save_gen: return
             tmp = self.save_file + ".tmp"
             try:
                 if isinstance(data,tuple):
@@ -434,7 +562,12 @@ class WorldManager:
             if gen == self.save_gen: self.save_error = None
 
     def serialize_records(self):
-        buf = [self.MAP_HEADER + "\n"]
+        return self._serialize()[0]
+
+    def _serialize(self):
+        """Map records and their parallel (group, heading) properties, one entry per block or mover record."""
+        buf = [self.MAP_HEADER + "\n"]; props = []
+        prop = lambda c: props.append([c.getTag("group"), float(c.getTag("heading") or 0)])
         movers = [m for m in self.moving_cubes if not m['np'].isEmpty()]
         ac = self.active_checkpoint_cube
         if ac is not None and not ac.isEmpty() and ac.getTag("material") == "4":
@@ -449,14 +582,14 @@ class WorldManager:
             if m:
                 l = f"B,{p.x},{p.y},{p.z},{m}"
                 if m == "5": l += f",{c.getTag('bounciness') or '1.3'},{c.getTag('max_height') or '0.0'}"
-                buf.append(l + "\n")
+                buf.append(l + "\n"); prop(c)
         for m in movers:
             c = m['np']; p = m['origin']
             kind = "L" if m.get("loop",False) else "M"
             l = f"{kind},{p.x},{p.y},{p.z},{c.getTag('material')},{m['speed']},{c.getTag('bounciness') or '1.3'},{c.getTag('max_height') or '0.0'}"
             for w in m['waypoints']: l += f",{w.x},{w.y},{w.z}"
-            buf.append(l + "\n")
-        return "".join(buf)
+            buf.append(l + "\n"); prop(c)
+        return "".join(buf), props
 
     def all_blocks(self):
         return [c for c in self.cubes if c != self.god_collision_floor] + [m['np'] for m in self.moving_cubes]
@@ -464,9 +597,8 @@ class WorldManager:
     def serialize_map(self, compress=True):
         """Capture scene values now; save writers can compress the immutable byte snapshot."""
         import gzip, json
-        nodes = self.all_blocks()
-        payload = {"version": 3, "records": self.serialize_records(),
-                   "properties": [[c.getTag("group"), float(c.getTag("heading") or 0)] for c in nodes]}
+        records, props = self._serialize()
+        payload = {"version": 3, "records": records, "properties": props}
         raw=json.dumps(payload,separators=(',',':')).encode('utf8')
         return b'DMAP3\n'+gzip.compress(raw,mtime=0) if compress else (raw,)
 
@@ -505,7 +637,7 @@ class WorldManager:
             try:
                 lines, props = self.read_map(source)
                 blocks, movers, cp, errors = self.parse_map(lines)
-                if errors or (props is not None and len(props) != len(blocks)+len(movers)):
+                if errors or (props is not None and len(props) != self.parsed_record_count):
                     raise ValueError('invalid records or properties')
             except (OSError, ValueError, KeyError, TypeError, EOFError, zlib.error) as e:
                 self.conversion_errors.append(f'{name}: {e}')
@@ -524,7 +656,8 @@ class WorldManager:
                 if moving: fields += [r['speed'], r['bounce'], r['max_h'], *[v for w in r['waypoints'] for v in w]]
                 elif r['mat'] == 5: fields += [r['bounce'], r['max_h']]
                 records.append(','.join(map(str, fields)))
-            payload = dict(version=3, records='\n'.join(records)+'\n', properties=props or [['', 0] for _ in blocks+movers])
+            props = [props[r['index']] for r in blocks+movers] if props is not None else [['', 0] for _ in blocks+movers]
+            payload = dict(version=3, records='\n'.join(records)+'\n', properties=props)
             data = b'DMAP3\n' + gzip.compress(json.dumps(payload, separators=(',', ':')).encode('utf8'), mtime=0)
             with open(target + '.tmp', 'wb') as f: f.write(data)
             os.replace(target + '.tmp', target)
@@ -599,8 +732,12 @@ class WorldManager:
         body = [(n, l) for n, l in body if l]
         v2 = bool(body) and body[0][1] == self.MAP_HEADER
         if v2: body = body[1:]
+        self.parsed_record_count = 0 # Block and mover records, valid or not: the length of a v3 properties list
         for n, line in body:
             parts = [p.strip() for p in line.split(',')]
+            index = None
+            if v2 and parts[0] in ("B", "M", "L"):
+                index = self.parsed_record_count; self.parsed_record_count += 1
             try:
                 if line.startswith("#"): raise ValueError("unknown header/comment")
                 if parts[0] == "CP":
@@ -609,7 +746,7 @@ class WorldManager:
                     elif not v2 and len(parts) == 4: cp = ('P', self._vec(parts[1:4]))
                     else: raise ValueError("bad checkpoint record")
                     continue
-                rec = {'bounce': 1.3, 'max_h': 0.0}
+                rec = {'bounce': 1.3, 'max_h': 0.0, 'index': index}
                 if v2:
                     kind = parts[0]
                     if kind == "B":
@@ -687,10 +824,10 @@ class WorldManager:
             return
 
         blocks, movers, cp, errors = self.parse_map(lines)
-        if properties is not None and len(properties) != len(blocks) + len(movers):
-            self.save_blocked = True
-            self.save_error = "Map properties do not match its objects; saving disabled."
-            return
+        if properties is not None and len(properties) != self.parsed_record_count:
+            # Keep the blocks; the original file is backed up below because errors is not empty
+            errors.append(f"map has {len(properties)} properties for {self.parsed_record_count} records; groups and headings were not loaded")
+            properties = None
         self.load_errors = errors
         if errors:
             for e in errors: print("Map load:", e)
@@ -711,25 +848,30 @@ class WorldManager:
             if c != self.god_collision_floor: self.recycle_cube(c)
         for m in self.moving_cubes: self.recycle_cube(m['np'])
 
-        self.cubes = [c for c in self.cubes if c == self.god_collision_floor]
+        self.cubes = NodeList(c for c in self.cubes if c == self.god_collision_floor)
         self.static_cube_order.clear()
         self.next_cube_order = 0
-        self.cube_map = {}; self.moving_cubes = []; self.active_checkpoint_cube = None; self.saved_checkpoint_pos = None
+        self.cube_map = {}; self.moving_cubes = MoverList(); self.active_checkpoint_cube = None; self.saved_checkpoint_pos = None
+        self.touch()
+
+        def apply_properties(c, rec):
+            # Each record carries its own properties index, so rejected records drop only their own entry.
+            if properties is None or rec.get('index') is None: return
+            group, heading = properties[rec['index']]
+            if group: c.setTag('group', group)
+            c.setTag('heading', str(heading))
 
         for rec in blocks:
             c = self._make_block(rec)
             self.cubes.append(c); self.cube_map[self.get_grid_key(rec['pos'])] = c
             self.register_cube(c)
             self.request_chunk_update(rec['pos'])
+            apply_properties(c, rec)
         for rec in movers:
             c = self._make_block(rec)
-            self.moving_cubes.append({'np': c, 'waypoints': rec['waypoints'], 'speed': rec['speed'], 'current_idx': 0, 'wait_timer': 0, 'origin': rec['pos'], 'direction': 1, 'loop': rec.get('loop',False)})
+            self.moving_cubes.append({'np': c, 'waypoints': rec['waypoints'], 'speed': rec['speed'], 'current_idx': 0, 'origin': rec['pos'], 'direction': 1, 'loop': rec.get('loop',False)})
             self.update_cube_faces(c)
-
-        if properties is not None:
-            for c, (group, heading) in zip(self.all_blocks(), properties):
-                if group: c.setTag('group', group)
-                c.setTag('heading', str(heading))
+            apply_properties(c, rec)
 
         if cp:
             kind, val = cp; c = None

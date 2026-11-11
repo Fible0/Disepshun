@@ -38,7 +38,7 @@ class EditorTools:
             ref = self.selected_movers[0] if self.selected_movers else None
             waypoints = [c.getPos()+(w-ref['origin']) for w in ref['waypoints']] if ref else []
             m = self.world.convert_to_mover(c, dict(waypoints=waypoints, speed=ref['speed'] if ref else 3.0,
-                current_idx=0, wait_timer=0, origin=c.getPos(), direction=1, loop=ref.get('loop',False) if ref else False))
+                current_idx=0, origin=c.getPos(), direction=1, loop=ref.get('loop',False) if ref else False))
             self.selected_movers.append(m)
 
     def editor_notice(self, text):
@@ -48,7 +48,7 @@ class EditorTools:
         self.fly_text_timer = 4
 
     def pick_object(self):
-        self.cTrav.traverse(self.render)
+        self.traverse_pick()
         if not self.cHandler.getNumEntries(): return None
         self.cHandler.sortEntries()
         hit = self.cHandler.getEntry(0)
@@ -82,6 +82,19 @@ class EditorTools:
         self.play_sfx('object_deselect' if removing else 'object_select')
         self.update_hud()
 
+    def selection_key(self):
+        # The list object itself (not a copy), its length, the tool colour and the map's edit counter.
+        return (self.selected_objects, len(self.selected_objects), self.tool_mode, self.world.block_version)
+
+    @staticmethod
+    def same_key(a, b):
+        return a is not None and a[0] is b[0] and a[1:] == b[1:]
+
+    def refresh_selection_if_changed(self):
+        """Per-frame entry point: rescan the selection only after it, the tool or the blocks change."""
+        if self.same_key(getattr(self, 'refreshed_selection', None), self.selection_key()): return
+        self.refresh_object_selection()
+
     def refresh_object_selection(self):
         if not self.selected_objects and not getattr(self,'highlighted_objects',None): return
         self.selected_objects = [c for c in self.selected_objects if not c.isEmpty() and not c.getParent().isEmpty()]
@@ -98,6 +111,7 @@ class EditorTools:
             else: c.clearPythonTag('selection_color')
             self.world.update_cube_faces(c)
         self.highlighted_objects = current
+        self.refreshed_selection = self.selection_key()
 
     @staticmethod
     def make_checkpoint_arrow():
@@ -157,9 +171,12 @@ class EditorTools:
 
     def reference_point(self, positions, grid_z=False):
         center=sum((VBase3(p) for p in positions),VBase3(0,0,0))/len(positions)
+        return self.pivot_for(center, positions[-1], grid_z)
+
+    def pivot_for(self, center, last, grid_z=False):
         off_grid=abs(center.x-round(center.x))>.01 or abs(center.y-round(center.y))>.01
         if grid_z: off_grid=off_grid or abs(center.z-.5-round(center.z-.5))>.01
-        if self.saved_settings.get('Use Last Selected as Pivot',False) or off_grid: return VBase3(positions[-1])
+        if self.saved_settings.get('Use Last Selected as Pivot',False) or off_grid: return VBase3(last)
         return center
 
     @staticmethod
@@ -180,8 +197,19 @@ class EditorTools:
             self.selection_center_node=marker
         # One waypoint-style marker represents both the center and active pivot.
         self.selection_pivot_node=marker
-        positions=[c.getPos(self.render) for c in self.selected_objects]
-        pivot=self.reference_point(positions,grid_z=any(not self.world.find_mover(c) for c in self.selected_objects))
+        key=self.selection_key()
+        cache=getattr(self,'selection_pivot_cache',None)
+        if cache is None or not self.same_key(cache[0],key):
+            # Static positions change only through edits (which bump the key); movers are re-read each frame.
+            static_sum=VBase3(0,0,0); movers=[]
+            for c in self.selected_objects:
+                if self.world.find_mover(c): movers.append(c)
+                else: static_sum+=c.getPos(self.render)
+            cache=self.selection_pivot_cache=(key,static_sum,movers,len(movers)<len(self.selected_objects))
+        _,static_sum,movers,has_static=cache
+        total=sum((c.getPos(self.render) for c in movers),VBase3(static_sum))
+        center=total/len(self.selected_objects)
+        pivot=self.pivot_for(center,self.selected_objects[-1].getPos(self.render),grid_z=has_static)
         marker.setPos(pivot); marker.show()
 
     def begin_edit(self, nodes):
@@ -230,8 +258,8 @@ class EditorTools:
 
     def commit_editor(self, sound, token=None, nodes=None, rate=None):
         if token is not None: self.finish_edit(token,self.selected_objects if nodes is None else nodes,sound)
-        self.world.map_is_dirty = True
-        self.world.save_map()
+        self.world.touch()
+        self.world.queue_save()
         if rate is None: self.play_sfx(sound)
         else: self.play_sfx(sound,rate)
         self.update_hud()
@@ -291,7 +319,7 @@ class EditorTools:
                 m = rec['mover']
                 if m:
                     self.world.convert_to_mover(c, dict(origin=m['origin']+delta, speed=m['speed'],
-                        waypoints=[w+delta for w in m['waypoints']], current_idx=0, direction=1, wait_timer=0, loop=m.get('loop',False)))
+                        waypoints=[w+delta for w in m['waypoints']], current_idx=0, direction=1, loop=m.get('loop',False)))
                 else:
                     self.world.cubes.append(c); self.world.cube_map[self.world.get_grid_key(pos)] = c
                     self.world.register_cube(c); self.world.request_chunk_update(pos)
@@ -300,25 +328,39 @@ class EditorTools:
 
     def valid_positions(self, positions, ignored):
         ignored = set(ignored)
-        # Nearby cells suffice for unit-cube overlap; avoid comparing every
-        # selected block against the entire map and every earlier selection.
+        world = self.world
+        # Nearby cells suffice for unit-cube overlap. Static blocks are already indexed
+        # by grid cell in cube_map; only movers and this edit's own blocks need bucketing.
         occupied = {}
-        for c in self.world.all_blocks():
+        for m in world.moving_cubes:
+            c = m['np']
             if c in ignored: continue
             q = c.getPos()
-            key = tuple(math.floor(v) for v in q)
-            occupied.setdefault(key, []).append(q)
+            occupied.setdefault((math.floor(q.x), math.floor(q.y), math.floor(q.z)), []).append(q)
+        statics = world.cube_map; floor = math.floor; limit = world.COORD_LIMIT; r = .999
         for p in positions:
-            if any(not math.isfinite(v) or abs(v)>self.world.COORD_LIMIT for v in p) or p.z < -19.5:
+            px, py, pz = p
+            if any(not math.isfinite(v) or abs(v)>limit for v in p) or pz < -19.5:
                 self.editor_notice('Objects must stay inside the map bounds'); return False
-            x,y,z = (math.floor(v) for v in p)
-            for cx in range(x-1,x+2):
-                for cy in range(y-1,y+2):
-                    for cz in range(z-1,z+2):
-                        if any(abs(p.x-q.x)<.999 and abs(p.y-q.y)<.999 and abs(p.z-q.z)<.999
-                               for q in occupied.get((cx,cy,cz), ())):
-                            self.editor_notice('Edit blocked: objects would overlap'); return False
-            occupied.setdefault((x,y,z), []).append(p)
+            # Only cells whose keys can hold a centre within reach on every axis: static blocks
+            # are keyed by floor(centre+0.5), movers and this edit's blocks by floor(centre).
+            blocked = False
+            for x in range(floor(px+.5-r), floor(px+.5+r)+1):
+                for y in range(floor(py+.5-r), floor(py+.5+r)+1):
+                    for z in range(floor(pz+.5-r), floor(pz+.5+r)+1):
+                        c = statics.get((x, y, z))
+                        if c is not None and c not in ignored:
+                            q = c.getPos()
+                            if abs(px-q.x)<r and abs(py-q.y)<r and abs(pz-q.z)<r: blocked = True
+            if occupied and not blocked:
+                for x in range(floor(px-r), floor(px+r)+1):
+                    for y in range(floor(py-r), floor(py+r)+1):
+                        for z in range(floor(pz-r), floor(pz+r)+1):
+                            for q in occupied.get((x, y, z), ()):
+                                if abs(px-q.x)<r and abs(py-q.y)<r and abs(pz-q.z)<r: blocked = True
+            if blocked:
+                self.editor_notice('Edit blocked: objects would overlap'); return False
+            occupied.setdefault((floor(px), floor(py), floor(pz)), []).append(p)
         return True
 
     def valid_static_grid(self, positions):
@@ -416,7 +458,12 @@ class EditorTools:
             return
         token = self.begin_edit([])
         added = []
-        movers = [m['np'].getPos() for m in self.world.moving_cubes]
+        movers = {}
+        for m in self.world.moving_cubes:
+            q = m['np'].getPos()
+            movers.setdefault((math.floor(q.x), math.floor(q.y), math.floor(q.z)), []).append(q)
+        near = lambda p: (q for dx in (-1,0,1) for dy in (-1,0,1) for dz in (-1,0,1)
+                          for q in movers.get((math.floor(p.x)+dx, math.floor(p.y)+dy, math.floor(p.z)+dz), ()))
         pp = self.physics.player.getPos()
         mode = getattr(self, 'fill_material', 1)
         for x in range(lo[0], hi[0]+1):
@@ -426,7 +473,7 @@ class EditorTools:
                     p = VBase3(x, y, z+.5)
                     key = self.world.get_grid_key(p)
                     if key in self.world.cube_map: continue
-                    if any(all(abs(p[i]-q[i]) < .99 for i in range(3)) for q in movers): continue
+                    if movers and any(all(abs(p[i]-q[i]) < .99 for i in range(3)) for q in near(p)): continue
                     if abs(pp.x-x) < .9 and abs(pp.y-y) < .9 and pp.z < z+1 and pp.z+self.physics.player_height > z: continue
                     mat = 1 + ((x+y+z) % 2) if mode == 6 else mode
                     c = self.world._make_block(dict(pos=p, mat=mat, bounce=self.cur_bounce, max_h=self.cur_h))
@@ -435,6 +482,7 @@ class EditorTools:
                     added.append(c)
         if added:
             self.finish_edit(token, added, 'fill')
+            self.world.touch()
             self.world.queue_save()
             self.play_block_action(True)
         else:

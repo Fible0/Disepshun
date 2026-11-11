@@ -171,6 +171,7 @@ class GameUI:
             ("Visual Floor", lambda v: self.base.set_visual_floor_visible(v), False),
             ("Use Last Selected as Pivot", lambda v: None, False), # Handled in Main via saved_settings
             ("Shaders", lambda v: self.base.toggle_shaders(v), True),
+            ("Cap Frame Rate", lambda v: None, False), # Applied each frame from saved_settings
             ("Discord Rich Presence", lambda v: self.base.presence.configure(enabled=v), True),
             ("Discord Show Activity", lambda v: self.base.presence.configure(show_activity=v), True),
             ("Discord Show Block Count", lambda v: self.base.presence.configure(show_block_count=v), True),
@@ -345,15 +346,6 @@ class GameUI:
         
         return btn
     
-    def toggle_gui(self):
-        self.gui_hidden = not self.gui_hidden
-        nodes = [self.crosshair_node, self.inv_node, self.fps_text, self.tool_text, self.fly_text]
-        for n in nodes: n.hide() if self.gui_hidden else n.show()
-        if not self.gui_hidden:
-            if not self.show_fps: self.fps_text.hide()
-            if not self.show_tool: self.tool_text.hide()
-            self.fly_text.hide()
-
     def set_menu_visible(self, v):
         self.menu_frame.show() if v else self.menu_frame.hide()
         if not v:

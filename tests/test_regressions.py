@@ -69,7 +69,7 @@ def physics(w): return Physics(w.render, NP('camera'), w)
 
 def app(w):
     a = App.__new__(App); a.sfx={}; a.sound_enabled=False; a.world=w; a.render=w.render; a.physics=physics(w)
-    a.preview=NP('preview'); a.preview.setZ(.5); a.tool_mode=1; a.build_material=1; a.spawned_cube_count=0
+    a.preview=NP('preview'); a.preview.setZ(.5); a.tool_mode=1; a.build_material=1; a.build_dist=5; a.spawned_cube_count=0
     a.selected_objects=[]; a.clipboard=[]; a.selection_node=None
     a.tool_phases={tool:'tinker' for tool in a.TOOL_SLOTS}; a.tool_phases[10]='select'
     a.keyMap=dict.fromkeys(('mouse1','mouse3','minus','plus','z','x'),False); a.timers=dict.fromkeys(a.keyMap,0)
@@ -98,6 +98,15 @@ def proof(name):
 
 def immediate(): return patch.object(threading,'Thread',ImmediateThread)
 
+def settle(w):
+    """Write the debounced save now, as the frame after the debounce window would."""
+    with immediate(): w.flush_saves()
+
+def mover_faces(node):
+    """A mover's single styled cube geom."""
+    geom=node.find('face_geom'); assert not geom.isEmpty() and geom.node().getNumGeoms()==1
+    return [geom]
+
 def live(w):
     return [c for c in w.cubes if c!=w.god_collision_floor]+[m['np'] for m in w.moving_cubes]
 
@@ -109,12 +118,12 @@ def attached(tmp):
             a.preview.setPos(x,0,.5); hit(a,m['np']); a.place(); m=w.moving_cubes[-1]
     for mc in w.moving_cubes:
         c=mc['np']
-        assert c.getParent()==w.platform_holder and len(c.find('face_geom').getChildren())==6 and not c.find('coll').isEmpty()
+        assert c.getParent()==w.platform_holder and len(mover_faces(c))==1 and not c.find('coll').isEmpty()
         assert c not in w.cube_pool
     a.cHandler=NS(getNumEntries=lambda:0); a.preview.setPos(0,5,.5)
     with immediate(): a.place()
     nodes=live(w); assert len(set(nodes))==len(nodes)==4
-    print('  2 attached blocks: parented, 6 faces, collider, not pooled; next placement is a distinct node')
+    print('  2 attached blocks: parented, one cube geom, collider, not pooled; next placement is a distinct node')
 
 @proof('B02 every material round-trips static and moving forms')
 def trampoline_save(tmp):
@@ -138,18 +147,18 @@ def unsaved(tmp):
     w=world(tmp); m=mover(w); save(w); a=app(w)
     with immediate():
         a.tool_mode=7; a.selected_movers=[m]; a.adj_val(1)
-    w2=world(tmp); w2.load_map(); assert w2.moving_cubes[0]['speed']==3.5
+    settle(w); w2=world(tmp); w2.load_map(); assert w2.moving_cubes[0]['speed']==3.5
     c=cube(w,(10,0,.5),'5'); save(w)
     with immediate():
         a.tool_mode=8; a.selected_trampolines=[c]; a.adj_val(1); a.adj_h(1)
-    w2=world(tmp); w2.load_map(); t=w2.cube_map[(10,0,1)]
+    settle(w); w2=world(tmp); w2.load_map(); t=w2.cube_map[(10,0,1)]
     assert t.getTag('bounciness')=='1.4' and t.getTag('max_height')=='0.5'
     s=cube(w,(20,0,.5),'1'); save(w)
     with immediate():
-        a.tool_mode=7; a.selected_movers=[]; a.tool_phases[7]='select'; hit(a,s); a.handle_sel(7)
+        a.tool_mode=7; a.selected_movers=[]; a.tool_phases[7]='select'; hit(a,s); a.select_object()
         assert s in w.cubes, 'selection must not convert a static block'
         a.tool_phases[7]='tinker'; a.adj_val(1)
-    w2=world(tmp); w2.load_map(); assert any(x['origin'].x==20 and x['waypoints']==[] for x in w2.moving_cubes)
+    settle(w); w2=world(tmp); w2.load_map(); assert any(x['origin'].x==20 and x['waypoints']==[] for x in w2.moving_cubes)
     print('  speed, bounce, height and waypointless conversion each survive reopen')
 
 @proof('B04 a delayed older writer cannot replace a newer snapshot')
@@ -254,9 +263,9 @@ def moving_cp(tmp):
 def cp_color(tmp):
     w=world(tmp); m=mover(w,material='4'); m2=mover(w,(3,0,.5),material='4'); p=physics(w)
     coll=m['np'].find('coll').node()
-    faces=lambda mc:[tuple(round(v,3) for v in n.getColor()) for n in mc['np'].findAllMatches('face_geom/*')]
+    faces=lambda mc:[tuple(round(v,3) for v in n.getColor()) for n in mover_faces(mc['np'])]
     with immediate(): p.activate_checkpoint(m['np'])
-    assert all(c==(0,.6,.8,1) for c in faces(m)) and len(faces(m))==6
+    assert all(c==(0,.6,.8,1) for c in faces(m)) and len(faces(m))==1
     with immediate(): p.activate_checkpoint(m2['np'])
     assert all(c==(0,1,0,1) for c in faces(m)) and all(c==(0,.6,.8,1) for c in faces(m2))
     assert m['np'].find('coll').node()==coll
@@ -334,7 +343,7 @@ def paused_undo(tmp):
     assert len(m['waypoints'])==1 and not Path(w.save_file).exists()
     a.paused=False; a.menu_open=False
     with immediate(): a.undo_wp()
-    assert m['waypoints']==[] and Path(w.save_file).exists()
+    settle(w); assert m['waypoints']==[] and Path(w.save_file).exists()
     print('  paused: no change, no save; unpaused: waypoint removed and saved')
 
 @proof('B21 crouching under a lethal ceiling does not kill; real contact does')
@@ -450,7 +459,7 @@ def groups(tmp):
     a.tool_phases[10]='select'
     a.selected_objects=[]; a.pick_object=lambda:c; a.select_object(); assert a.selected_objects==[c,d]
     a.select_object(); assert not a.selected_objects
-    w.load_map(); assert all(n.getTag('group')==group for n in w.cubes)
+    settle(w); w.load_map(); assert len(w.cubes)==2 and all(n.getTag('group')==group for n in w.cubes)
     a.selected_objects=list(w.cubes); a.tool_phases[10]='tinker'
     with immediate(): a.group_selection(True)
     assert all(not n.getTag('group') for n in w.cubes)
@@ -463,8 +472,8 @@ def batch_transform(tmp):
     assert c.getPos()==V(2,4,1.5) and w.cube_map[w.get_grid_key(c.getPos())]==c
     assert m['origin']==V(2,3,1.5) and m['waypoints']==[V(-2,3,1.5)]
     assert c in w.chunk_contents[w.get_chunk_key(c.getPos())] and c not in w.cube_pool
-    assert len(m['np'].find('face_geom').getChildren())==6
-    w.load_map(); assert w.moving_cubes[0]['waypoints']==[V(-2,3,1.5)]
+    assert len(mover_faces(m['np']))==1
+    settle(w); w.load_map(); assert w.moving_cubes[0]['waypoints']==[V(-2,3,1.5)]
 
 @proof('E04 blocked batch transform makes no partial changes')
 def batch_overlap(tmp):
@@ -491,7 +500,7 @@ def clipboard(tmp):
     mm=w.find_mover(copied[1]); assert mm['origin']==V(11,0,.5) and mm['waypoints']==[V(15,0,.5)]
     with immediate(): a.selection_command('delete')
     assert len(w.all_blocks())==2 and not a.selected_objects
-    w.load_map(); assert len(w.all_blocks())==2
+    settle(w); w.load_map(); assert len(w.all_blocks())==2
 
 @proof('E06 checkpoint direction survives save/reopen and controls respawn; pooling clears it')
 def facing(tmp):
@@ -564,7 +573,7 @@ def two_modes(tmp):
             elif tool==9: a.adjust_checkpoint(1); assert c.getTag('heading')=='15.0'
             elif tool==10: a.group_selection(); assert c.getTag('group')
             else: a.transform_selection(1,0,0); assert c.getX()==1
-        assert Path(w.save_file).exists(); Path(w.save_file).unlink()
+        settle(w); assert Path(w.save_file).exists(); Path(w.save_file).unlink()
         a.toggle_tool_phase(); assert a.tool_phases[tool]=='select' and a.selected_objects==[c]
         a.pick_object=lambda:c; a.select_object(); assert not a.selected_objects
 
@@ -575,13 +584,13 @@ def tool_colors(tmp):
         w=world(tmp); c=cube(w); m=mover(w,(3,0,.5),'3'); a=app(w); a.tool_mode=tool
         a.selected_objects=[c,m['np']]; a.refresh_object_selection(); w.update_chunks()
         assert c.getPythonTag('selection_color')==color
-        assert all(tuple(round(v,2) for v in f.getColor())==color for f in m['np'].find('face_geom').getChildren())
-        assert all(f.getMaterial().getEmission().lengthSquared()>0 and f.hasTexture(w.glow_stage) for f in m['np'].find('face_geom').getChildren())
+        assert all(tuple(round(v,2) for v in f.getColor())==color for f in mover_faces(m['np']))
+        assert all(f.getMaterial().getEmission().lengthSquared()>0 and f.hasTexture(w.glow_stage) for f in mover_faces(m['np']))
         face=NP('selected_static'); w.style_face(face,c)
         assert tuple(round(v,2) for v in face.getColor())==color and tuple(face.getColorScale())==(1,1,1,1)
         a.selected_objects=[]; a.refresh_object_selection()
         assert not c.hasPythonTag('selection_color') and not m['np'].hasPythonTag('selection_color')
-        assert all(tuple(f.getColor())==(1,0,0,1) for f in m['np'].find('face_geom').getChildren())
+        assert all(tuple(f.getColor())==(1,0,0,1) for f in mover_faces(m['np']))
         w.style_face(face,c); assert tuple(face.getColor())==(1,1,1,1)
 
 @proof('E13 glowing blocks retain emission and a diffuse lighting response')
@@ -597,7 +606,7 @@ def lit_glow(tmp):
             for i in range(geom.node().getNumGeoms()):
                 state=geom.node().getGeomState(i); attr=state.getAttrib(core.MaterialAttrib)
                 assert attr is not None and max(tuple(attr.getMaterial().getEmission())[:3])>0
-    assert all(f.hasMaterial() for f in m['np'].find('face_geom').getChildren())
+    assert all(f.hasMaterial() for f in mover_faces(m['np']))
 
 @proof('E14 either Shift crouches and descends in flight; Ctrl does neither')
 def shift_crouch(tmp):
@@ -644,7 +653,7 @@ def glow_masks(tmp):
             c.clearPythonTag('selection_color'); w.style_face(face,c)
             assert face.hasTexture(w.glow_stage)
     m=mover(w,(12,0,.5),'4')
-    assert all(f.hasTexture(w.glow_stage) for f in m['np'].find('face_geom').getChildren())
+    assert all(f.hasTexture(w.glow_stage) for f in mover_faces(m['np']))
 
 @proof('E17 a checkpoint seam retains one activation across frames and partial collision probes')
 def stable_checkpoint_seam(tmp):
@@ -1075,17 +1084,20 @@ def all_sound_variation(tmp):
 
 @proof('E43 respawn varies without changing its seek time; checkpoint keeps its existing pitch progression')
 def direct_sound_variation(tmp):
-    w=world(tmp); p=physics(w); p.respawn_sfx=RecordedSound(); p.checkpoint_sfx=RecordedSound()
-    with patch.object(builtins.base,'sound_enabled',True):
+    w=world(tmp); p=physics(w); a=app(w); a.sound_enabled=True
+    a.sfx={'respawn':RecordedSound(),'checkpoint':RecordedSound()}
+    with patch.object(builtins.base,'play_sfx',a.play_sfx):
         with patch.object(G['random'],'uniform',side_effect=[.95,.94,1.05,1.0]):
             p.respawn(); p.just_respawned=False; p.respawn()
-        assert p.respawn_sfx.rates==[.95,1.05] and p.respawn_sfx.volumes==[.94,1.0]
-        assert p.respawn_sfx.times==[.5,.5] and p.respawn_sfx.plays==2
+        respawn=a.sfx['respawn']
+        assert respawn.rates==[.95,1.05] and respawn.volumes==[.94,1.0]
+        assert respawn.times==[.5,.5] and respawn.plays==2
         c=cube(w,material='4'); d=cube(w,(2,0,.5),'4')
         with patch.object(G['random'],'uniform',side_effect=AssertionError('Checkpoint must not be randomized')):
             p.activate_checkpoint(c); p.activate_checkpoint(d)
-        assert p.checkpoint_sfx.rates==[1.0,1.1] and p.checkpoint_sfx.times==[.3,.3]
-        assert not p.checkpoint_sfx.volumes and p.checkpoint_sfx.plays==2
+        checkpoint=a.sfx['checkpoint']
+        assert checkpoint.rates==[1.0,1.1] and checkpoint.times==[.3,.3]
+        assert checkpoint.volumes==[1.0,1.0] and checkpoint.plays==2
 
 @proof('E44 trampoline height uses the Checkpoint numeric cue in both directions')
 def height_sound_directions(tmp):
@@ -1184,21 +1196,21 @@ def shared_direction_audio(tmp):
     assert a.sfx['checkpoint_turn'].volumes==[.97]*10
     assert all(sound.plays==0 for name,sound in a.sfx.items() if name!='checkpoint_turn')
 
-@proof('E49 GPU advice requires a known lower-priority renderer and a distinct preferred hardware adapter')
+@proof('E49 the GPU overview lists the renderer and other adapters, and is Windows-only')
 def gpu_detection(tmp):
-    from disepshun.gpu_advice import gpu_recommendation
+    from disepshun.gpu_advice import renderer_info
     low={'name':'Intel(R) UHD Graphics 770','id':(0,1)}
     high={'name':'NVIDIA GeForce RTX 3050','id':(0,2)}
-    power=[low,high];performance=[high,low]
-    result=gpu_recommendation('Intel UHD Graphics 770',power,performance)
-    assert result=={'current':'Intel UHD Graphics 770','recommended':high['name']}
-    assert gpu_recommendation(high['name'],power,performance) is None
-    assert gpu_recommendation(low['name'],[low],[low]) is None
-    assert gpu_recommendation(high['name'],[high],[high]) is None
-    assert gpu_recommendation('Unknown GPU',power,performance) is None
-    assert gpu_recommendation('llvmpipe (software)',power,performance) is None
-    assert gpu_recommendation('',power,performance) is None
-    assert gpu_recommendation(low['name'],[],[]) is None
+    with patch('disepshun.gpu_advice.windows_adapter_orders',return_value=([low,high],[high,low])):
+        info=renderer_info('Intel UHD Graphics 770')
+    assert info=={'current':'Intel UHD Graphics 770','others':[high['name']],'enumerated':True}
+    with patch('disepshun.gpu_advice.windows_adapter_orders',return_value=([],[])):
+        assert renderer_info('')=={'current':'Unknown renderer','others':[],'enumerated':False}
+    a=app(world(tmp)); notices=[]; a.saved_settings={}
+    a.ui=NS(show_gpu_notice=notices.append)
+    a.win=NS(getGsg=lambda:NS(getDriverRenderer=lambda:'llvmpipe'))
+    with patch.object(os,'name','posix'): a.check_startup_gpu()
+    assert not notices and 'GPU Notice Shown' not in a.saved_settings
 
 @proof('E50 GPU overview appears once, persists across launches, and Escape closes it')
 def gpu_startup_and_escape(tmp):
@@ -1208,10 +1220,11 @@ def gpu_startup_and_escape(tmp):
     info={'current':'Intel UHD Graphics 770','recommended':'NVIDIA GeForce RTX 3050'}
     a.settings_file=str(Path(tmp)/'settings.json')
     with patch('disepshun.gpu_advice.renderer_info',return_value=info) as check:
-        a.check_startup_gpu();a.check_startup_gpu()
+        with patch.object(os,'name','nt'): a.check_startup_gpu();a.check_startup_gpu()
         assert notices==[info] and check.call_count==1
         a.load_settings();assert a.saved_settings['GPU Notice Shown'] is True
-        a.check_startup_gpu(); assert check.call_count==1
+        with patch.object(os,'name','nt'): a.check_startup_gpu()
+        assert check.call_count==1
     a.gpu_notice_open=True;a.paused=True
     a.ui.close_gpu_notice=lambda:setattr(a,'gpu_notice_open',False)
     a.toggle_menu();assert not a.gpu_notice_open and not a.menu_open
@@ -1695,6 +1708,158 @@ def optimized_editor_overlap(tmp):
         notices.clear()
         assert a.valid_positions(positions,ignored)==expected
         assert notices==([reason] if reason else [])
+
+
+@proof('R01 block containers keep list behaviour with O(1) lookups; empty chunk bookkeeping is dropped')
+def block_containers(tmp):
+    w=world(tmp); a=cube(w); b=cube(w,(40,40,.5)); m=mover(w,(3,0,.5))
+    assert w.cubes==[a,b] and w.cubes[-1]==b and w.cubes[:1]==[a] and b in w.cubes and len(w.cubes)==2
+    assert w.find_mover(m['np']) is m and w.find_mover(a) is None and m in w.moving_cubes
+    assert w.find_mover(m['np'].find('coll').getParent()) is m  # another handle to the same node
+    for c in w.cubes: w.cubes.remove(c)  # removal while iterating is safe
+    assert not w.cubes and w.cubes==[]
+    w.cubes.extend([a,b]); key=w.get_chunk_key(b.getPos())
+    assert key in w.chunk_contents and key in w.collision_chunks
+    w.remove_block(b); assert key not in w.chunk_contents and b not in w.cubes
+    w.update_chunks(); assert key not in w.collision_chunks
+    before=dict(w.chunk_contents); w.remove_block(m['np'])
+    assert w.chunk_contents==before and not w.moving_cubes and w.find_mover(m['np']) is None
+    print('  list operations intact; mover lookup by node; empty chunk entries and collider holders removed')
+
+@proof('R02 mover cell index gives the same contacts and landings as scanning every mover')
+def mover_index(tmp):
+    import random
+    rng=random.Random(2024); w=world(tmp); a=app(w); p=a.physics; p.flying=True
+    for _ in range(60):
+        pos=V(*(rng.uniform(-6,6) for _ in range(3)))
+        if w.get_grid_key(pos) not in w.cube_map: cube(w,pos)
+    for _ in range(80): mover(w,tuple(rng.uniform(-6,6) for _ in range(3)),wp=tuple(rng.uniform(-6,6) for _ in range(3)))
+    for frame in range(3):
+        a.update_world(TASK); assert w.mover_index is not None
+        for i in range(400):
+            pos=V(*(rng.uniform(-7,7) for _ in range(3))); h=(.9,1.67)[i%2]
+            ignore=tuple(m['np'] for m in w.moving_cubes[:3]) if i%3==0 else ()
+            indexed=p.get_contacts(pos,h,ignore)
+            saved=w.mover_index; w.mover_index=None
+            assert p.get_contacts(pos,h,ignore)==indexed, pos
+            w.mover_index=saved
+    a.update_world(TASK); w.remove_block(w.moving_cubes[0]['np'])
+    assert w.movers_near(0,0,0,0,0,0)==[(m['np'],m['np'].getPos(w.render)) for m in w.moving_cubes]  # stale index unused
+    w=world(tmp); m=mover(w,(0,0,.5),wp=(0,0,.5)); a=app(w); a.physics.player.setPos(0,0,1.3); a.physics.vz=-3
+    a.update_world(TASK); assert w.mover_index is not None
+    for _ in range(20): a.physics.update(1/120,KEYS)
+    assert a.physics.ground and abs(a.physics.player.getZ()-1)<1e-4
+    print('  1,200 indexed queries over 80 moving blocks match the full scan; landing on an indexed mover works')
+
+@proof('R03 jump height is independent of frame rate with fixed physics steps')
+def fixed_step(tmp):
+    peaks=[]
+    for fps in (30,60,144,240,300):
+        w=world(tmp); cube(w); a=app(w); p=a.physics; p.player.setPos(0,0,1); a.keyMap=dict(KEYS,space=True)
+        top=[0.]; real=p.update
+        def update(dt,keys): real(dt,keys); top[0]=max(top[0],p.player.getZ())
+        p.update=update
+        for _ in range(int(fps*.9)): a.step_physics(1/fps)
+        peaks.append(top[0])
+    assert max(peaks)-min(peaks)<1e-6, peaks
+    a.physics_time=0; a.step_physics(5.0); assert a.physics_time<a.PHYSICS_STEP  # a long hitch runs at most 0.1 s
+    w=world(tmp); t=cube(w,material='5'); a=app(w)
+    a.tool_mode=8; a.selected_trampolines=[t]; a.bounce_ghosts=[]; a.make_ghost=lambda color: NP('ghost')
+    a.update_bounce_ghosts(); assert any(k[2]==round(a.PHYSICS_STEP,4) for k in a.physics.bounce_cache)
+    print(f'  standing jump peaks {min(peaks)-1:.4f} at 30, 60, 144, 240 and 300 FPS; ghosts use the physics step')
+
+@proof('R04 falls have a terminal speed and invincible falls below the map return to the checkpoint')
+def terminal_fall(tmp):
+    w=world(tmp); p=physics(w); p.player.setPos(0,0,500); p.vz=-1e6; p.update(1/240,KEYS)
+    assert p.vz>=-p.max_fall_speed and p.player.getZ()>500-2
+    w=world(tmp); p=physics(w); p.god_mode=True; p.checkpoint=V(0,0,1); p.player.setPos(0,0,-999.9); p.vz=-50
+    p.update(1/240,KEYS); assert p.just_respawned and p.player.getPos()==V(0,0,1)
+    steps=max(1,math.ceil(p.max_fall_speed/240/p.max_step)); assert steps==5
+    print('  speed capped at 300 (at most 5 sub-steps per 1/240 s step); z<-1000 respawns at the checkpoint')
+
+@proof('R05 a v3 map with one rejected record loads the rest with their own groups and headings')
+def partial_v3(tmp):
+    w=world(tmp)
+    for x,g,h in ((0,'one',15),(2,'two',30),(4,'three',45)):
+        c=cube(w,(x,0,.5)); c.setTag('group',g); c.setTag('heading',str(h))
+    m=mover(w,(6,0,.5)); m['np'].setTag('group','four'); m['np'].setTag('heading','60')
+    save(w); data=json.loads(gzip.decompress(Path(w.save_file).read_bytes()[6:]))
+    data['records']=data['records'].replace('B,2.0,0.0,0.5,1','B,2.0,0.0,0.5,9')
+    Path(w.save_file).write_bytes(b'DMAP3\n'+gzip.compress(json.dumps(data).encode()))
+    w.load_map()
+    assert not w.save_blocked and len(w.load_errors)==1 and list(Path(tmp).glob('map.txt.*.bak'))
+    got={(c.getX(),c.getTag('group'),c.getTag('heading')) for c in w.all_blocks()}
+    assert got=={(0,'one','15.0'),(4,'three','45.0'),(6,'four','60.0')}, got
+    data['properties']=data['properties'][:-1]
+    Path(w.save_file).write_bytes(b'DMAP3\n'+gzip.compress(json.dumps(data).encode()))
+    w.load_map(); assert not w.save_blocked and len(w.all_blocks())==3 and len(w.load_errors)==2
+    print('  bad middle record dropped; remaining blocks and mover keep their own properties; mismatched list still loads blocks')
+
+@proof('R06 undo and redo patch surviving blocks in place, and history is capped by captured blocks')
+def history_in_place(tmp):
+    w=world(tmp); a=app(w); a.tool_mode=11
+    nodes=[cube(w,(x,0,.5)) for x in range(5)]; m=mover(w,(0,3,.5),wp=(0,6,.5)); a.selected_objects=nodes+[m['np']]
+    with immediate(): a.transform_selection(0,0,2)
+    assert a.history_step()
+    assert all(c in w.cubes and c.getZ()==.5 and w.cube_map[w.get_grid_key(c.getPos())]==c for c in nodes)
+    assert w.find_mover(m['np']) is m and m['origin']==V(0,3,.5) and m['waypoints']==[V(0,6,.5)]
+    assert list(w.cubes)==nodes and not w.cube_pool
+    assert a.history_step(True) and all(c.getZ()==2.5 for c in nodes) and m['origin']==V(0,3,2.5)
+    from disepshun.edit_history import EditHistory
+    h=EditHistory(w,limit=100,max_states=12)
+    for i in range(6):
+        token=h.begin(nodes[:3]); nodes[0].setTag('heading',str(i+1)); h.finish(token,nodes[:3],'turn')
+    assert len(h.undo_stack)==2 and sum(h.entry_size(e) for e in h.undo_stack)<=12
+    big=EditHistory(w,limit=100,max_states=1)
+    token=big.begin(nodes); nodes[0].setTag('heading','99'); big.finish(token,nodes,'turn')
+    assert len(big.undo_stack)==1  # the newest entry is always kept
+    print('  move undo/redo keeps the same nodes and save order; 12-state cap keeps the 2 newest 6-state entries')
+
+@proof('R07 deletes and editor commits are debounced; superseded snapshots are not written')
+def debounced_edits(tmp):
+    w=world(tmp); c=cube(w); d=cube(w,(2,0,.5)); a=app(w)
+    hit(a,c)
+    with immediate(): a.delete()
+    assert c not in w.cubes and not Path(w.save_file).exists() and w.pending_save_at is not None
+    with patch.object(time,'monotonic',return_value=w.pending_save_at+1), immediate(): w.retry_save(0)
+    assert '\nB,2.0,' in map_text(w.save_file) and '\nB,0.0,' not in map_text(w.save_file)
+    jobs=[]; writes=[]
+    class QueuedThread:
+        def __init__(self,target,args,**kw): self.target,self.args=target,args
+        def start(self): jobs.append((self.target,self.args))
+        def is_alive(self): return False
+    with patch.object(threading,'Thread',QueuedThread):
+        w.map_is_dirty=True; w.save_map(); d.setX(8); w.map_is_dirty=True; w.save_map()
+    real_open=open
+    def counting_open(f,*args,**kw):
+        if str(f).endswith('.tmp'): writes.append(f)
+        return real_open(f,*args,**kw)
+    with patch.object(builtins,'open',counting_open):
+        for fn,args in jobs: fn(*args)
+    assert len(writes)==1 and '\nB,8.0,' in map_text(w.save_file)
+    print('  delete waits for the debounce; of two queued snapshots only the newest is written')
+
+@proof('R08 per-frame selection work runs only after the selection, tool or blocks change')
+def selection_dirty(tmp):
+    w=world(tmp); a=app(w); a.tool_mode=11
+    nodes=[cube(w,(x,0,.5)) for x in range(4)]; m=mover(w,(4,0,.5),wp=(9,0,.5))
+    calls=[]; real=a.refresh_object_selection
+    a.refresh_object_selection=lambda: (calls.append(1), real())
+    a.selected_objects=nodes[:2]
+    for _ in range(5): a.refresh_selection_if_changed()
+    assert len(calls)==1 and nodes[0].hasPythonTag('selection_color')
+    a.selected_objects.append(nodes[2]); a.refresh_selection_if_changed(); assert len(calls)==2
+    w.touch(); a.refresh_selection_if_changed(); assert len(calls)==3
+    a.tool_mode=10; a.refresh_selection_if_changed(); assert len(calls)==4
+    a.tool_mode=11; a.refresh_selection_if_changed(); a.refresh_selection_if_changed(); assert len(calls)==5
+    a.draw_selection_center(); cache=a.selection_pivot_cache
+    a.draw_selection_center(); assert a.selection_pivot_cache is cache
+    a.selected_objects=nodes+[m['np']]; a.draw_selection_center(); first=V(a.selection_center_node.getPos())
+    m['np'].setX(9); a.draw_selection_center()
+    assert first==V(2,0,.5) and abs(a.selection_center_node.getX()-3)<1e-5  # the moving block is re-read every frame
+    expected=a.reference_point([c.getPos(w.render) for c in a.selected_objects],grid_z=True)
+    assert (a.selection_center_node.getPos()-expected).length()<1e-5
+    print('  5 idle frames: 1 rescan; append, block edit and tool change each rescan once; pivot follows movers')
 
 
 if __name__=='__main__':
