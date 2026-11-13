@@ -20,6 +20,7 @@ class Particle:
 class ParticleSystem:
     def __init__(self, parent, pool_size=300):
         self.active_parts = []
+        self.last_update_time = None
         self.pool_size = pool_size
         self.parent = parent
         
@@ -37,6 +38,7 @@ class ParticleSystem:
         
     def explode(self, pos):
         # Respawn effect (Type 0)
+        self.last_update_time = None
         for p in self.active_parts:
             if p.p_type == 0 and not p.node.isEmpty():
                 p.node.removeNode()
@@ -65,12 +67,14 @@ class ParticleSystem:
 
     def activate_checkpoint(self, pos):
         # Checkpoint activation effect (Type 1)
+        available = max(0, self.pool_size-len(self.active_parts))
+        if not available: return
+        self.last_update_time = None
         rnd = random.uniform
         px, py, pz = pos.x, pos.y, pos.z + 0.6
         curr_t = ClockObject.getGlobalClock().getFrameTime()
         
         # A burst of placements must not create an unbounded number of nodes.
-        available = max(0, self.pool_size-len(self.active_parts))
         for _ in range(min(30, available)):
             sx = px + rnd(-0.4, 0.4)
             sy = py + rnd(-0.4, 0.4)
@@ -89,6 +93,11 @@ class ParticleSystem:
         if not self.active_parts: return
 
         curr_t = ClockObject.getGlobalClock().getFrameTime()
+
+        # Physics may step several times per rendered frame. Particle motion uses
+        # absolute frame time, so repeating it cannot change any visible state.
+        if curr_t == self.last_update_time: return
+        self.last_update_time = curr_t
         alive = []
         
         for p in self.active_parts:

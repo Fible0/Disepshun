@@ -27,11 +27,90 @@ class PlayerPhysics:
         self.pending_land = None
         self.step_dist = 0.0; self.step_len = 1.6 # Ground distance between footstep sounds
         self.particles = ParticleSystem(self.render)
+        self.last_safe_spawn = VBase3(0, 0, 1)
+        self.spawn_recovery_flight = False
 
-    def set_spawn_position(self, position):
+    def _spawn_body_clear(self, position):
+        minimum = self.lower_bound if self.god_mode else -20
+        if not all(math.isfinite(v) for v in position) or position.z < minimum: return False
+        floor, hits = self.get_contacts(position, self.h_stand)
+        return not floor and not hits
+
+    def _spawn_supported(self, position):
+        if not self._spawn_body_clear(position): return False
+        # Check the gap below the normal checkpoint spawn as well as the feet.
+        # A lethal support would kill the player on the very next gravity step.
+        below = LPoint3d(position.x, position.y, position.z-.51)
+        floor, hits = self.get_contacts(below, .51)
+        return bool(floor or hits) and not any(c.getTag('material') == '3' for c in hits)
+
+    def resolve_spawn_position(self, position):
+        """Find a clear supported spawn without triggering checkpoint or hazard events."""
+        preferred = VBase3(position) if all(math.isfinite(v) for v in position) else VBase3(0,0,1)
+        clear_air = preferred if self._spawn_body_clear(preferred) else None
+        if self._spawn_supported(preferred): return preferred, False
+        # Nearby same-level floor is preferable to jumping to the top of a stack.
+        for radius in range(1, 5):
+            for dx,dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1)):
+                candidate = preferred + VBase3(dx*radius,dy*radius,0)
+                if self._spawn_supported(candidate): return candidate, False
+                if clear_air is None and self._spawn_body_clear(candidate): clear_air = candidate
+        if self._spawn_supported(self.last_safe_spawn): return VBase3(self.last_safe_spawn), False
+
+        # Inspect nearby block tops once, rather than letting collision resolution
+        # push a buried player upward through every checkpoint in a tall column.
+        world = self.world_manager; cs = world.chunk_size
+        xs = range(math.floor((preferred.x-5)/cs), math.floor((preferred.x+5)/cs)+1)
+        ys = range(math.floor((preferred.y-5)/cs), math.floor((preferred.y+5)/cs)+1)
+        zs = range(math.floor((self.lower_bound-1)/cs), math.floor(world.COORD_LIMIT/cs)+1)
+        def nearby_nodes():
+            for x in xs:
+                for y in ys:
+                    for z in zs: yield from world.chunk_contents.get((x,y,z), ())
+            for mover in world.moving_cubes: yield mover['np']
+        candidates = []; half_width = .5+self.w/2
+        for order,node in enumerate(nearby_nodes()):
+            if order >= 65536: break
+            if node.isEmpty() or node.getTag('material') == '3': continue
+            pos = node.getPos(self.render)
+            if abs(pos.x-preferred.x)>4 or abs(pos.y-preferred.y)>4: continue
+            candidate = pos + VBase3(0,0,.5)
+            x,y,z = world.get_grid_key(pos)
+            above = world.cube_map.get((x,y,z+1))
+            if above is not None:
+                q = above.getPos(self.render)
+                if (abs(q.x-pos.x)<half_width and abs(q.y-pos.y)<half_width and
+                        candidate.z<q.z+.5 and candidate.z+self.h_stand>q.z-.5): continue
+            candidates.append(((candidate-preferred).lengthSquared(),order,candidate))
+        from heapq import nsmallest
+        for _,_,candidate in nsmallest(64,candidates):
+            if self._spawn_supported(candidate): return candidate, False
+        if world.god_floor_enabled:
+            floor = world.god_collision_floor.getPos(self.render); half = world.FLOOR_HALF-self.w/2
+            candidate = VBase3(max(floor.x-half,min(floor.x+half,preferred.x)),
+                               max(floor.y-half,min(floor.y+half,preferred.y)),floor.z+.5)
+            if self._spawn_supported(candidate): return candidate, False
+
+        # A map can have no safe floor at all. Recovery flight keeps the editor
+        # usable without repeatedly dying, or disabling hazards elsewhere.
+        if clear_air is not None: return clear_air, True
+        candidate = VBase3(preferred.x,preferred.y,max(preferred.z,-19.5))
+        if self._spawn_body_clear(candidate): return candidate, True
+        for height in (max(world.COORD_LIMIT+2,preferred.z+2), world.COORD_LIMIT*2+2):
+            candidate = VBase3(preferred.x,preferred.y,height)
+            if self._spawn_body_clear(candidate): return candidate, True
+        return VBase3(0,0,world.COORD_LIMIT*2+2), True
+
+    def set_spawn_position(self, position, safe=False):
+        if safe:
+            position, recovery = self.resolve_spawn_position(position)
+            self.spawn_recovery_flight = recovery
+            if recovery: self.flying = True
+            else: self.last_safe_spawn = VBase3(position)
         self.player.setPos(position)
         self.fall_peak_z = self.player.getZ()
         self.pending_land = None
+        return self.player.getPos()
 
     def start_cyan_effect(self):
         if hasattr(builtins.base, 'particles_enabled') and not builtins.base.particles_enabled: return
@@ -47,7 +126,7 @@ class PlayerPhysics:
         ac = self.world_manager.active_checkpoint_cube
         if ac is not None and not ac.isEmpty() and not ac.getParent().isEmpty():
             self.checkpoint = ac.getPos(self.render) + VBase3(0, 0, 1)
-        self.set_spawn_position(self.checkpoint)
+        self.set_spawn_position(self.checkpoint, safe=True)
         self.player.setHpr(float(ac.getTag("heading") or 0) if ac is not None and not ac.isEmpty() else 0, 0, 0)
         self.camera.setP(0)
         self.vz = 0; self.ground = False; self.coyote = 0.0; self.just_respawned = True; self.start_cyan_effect()
@@ -79,11 +158,16 @@ class PlayerPhysics:
         return True
 
     def get_contacts(self, p_pos, h, ignore=()):
-        """Side-effect-free overlap query. Returns (out_of_bounds_or_floor, [overlapping cubes])."""
-        if not (-10000 < p_pos.x < 10000) or not (-10000 < p_pos.y < 10000) or not (-1000 < p_pos.z < 1000): return True, []
-        min_x = p_pos.x - self.w/2; max_x = p_pos.x + self.w/2
-        min_y = p_pos.y - self.w/2; max_y = p_pos.y + self.w/2
-        min_z = p_pos.z; max_z = p_pos.z + h
+        """Side-effect-free overlap query. Returns (invalid_position_or_floor, [overlapping cubes])."""
+        px = p_pos.x; py = p_pos.y; pz = p_pos.z
+        # Save bounds constrain block centres, not the player's position. An
+        # artificial collision outside those bounds prevents returning on foot
+        # after flight and used to disable every block above altitude 1000.
+        if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz)): return True, []
+        hw = self.w/2
+        min_x = px - hw; max_x = px + hw
+        min_y = py - hw; max_y = py + hw
+        min_z = pz; max_z = pz + h
         overlaps = lambda cp: (min_x < cp.x+0.5 and max_x > cp.x-0.5 and min_y < cp.y+0.5 and max_y > cp.y-0.5 and min_z < cp.z+0.5 and max_z > cp.z-0.5)
         hits = []
         wm = self.world_manager
@@ -104,10 +188,12 @@ class PlayerPhysics:
             sz, ez = math.floor(min_z), math.ceil(max_z+1)
         except: return True, hits
 
+        get_cube = wm.cube_map.get; render = self.render
+        ys = range(sy, ey); zs = range(sz, ez)
         for x in range(sx, ex):
-            for y in range(sy, ey):
-                for z in range(sz, ez):
-                    if (c := wm.cube_map.get((x, y, z))) and c not in ignore and overlaps(c.getPos(self.render)): hits.append(c)
+            for y in ys:
+                for z in zs:
+                    if (c := get_cube((x, y, z))) and c not in ignore and overlaps(c.getPos(render)): hits.append(c)
         return floor, hits
 
     def handle_contacts(self, hits):
@@ -151,9 +237,15 @@ class PlayerPhysics:
 
     def vertical_step(self, dz, keys):
         """Move by one vertical sub-step. Returns True when the fall/rise was stopped."""
-        pp = self.player.getPos() + VBase3(0, 0, dz)
-        if not self.check_collision(pp, self.player_height):
-            self.player.setPos(pp); self.ground = False
+        current = self.player.getPos()
+        position = current + VBase3(0, 0, dz)
+        # At high altitude, a small gravity step can round back to the same
+        # float32 position. Probe its real displacement so support is retained.
+        pp = LPoint3d(current.x, current.y, current.z+dz) if dz and position.z == current.z else position
+        floor, contacts = self.get_contacts(pp, self.player_height)
+        self.handle_contacts(contacts)
+        if not floor and not contacts:
+            self.player.setPos(position); self.ground = False
             self.fall_peak_z=max(self.fall_peak_z,self.player.getZ())
             return False
         if self.just_respawned: return True
@@ -168,8 +260,14 @@ class PlayerPhysics:
             if (cp.x - pp.x)**2 + (cp.y - pp.y)**2 + (cp.z - pp.z)**2 > 9.0: return
             if check_area(cp.x, cp.y, cp.z, pp.x, pp.y, pp.z) and cp.z+0.5 > hgz: hgz = cp.z+0.5; g_cube = c
 
-        hw = self.w/2
-        for c, cp in self.world_manager.movers_near(pp.x-hw, pp.x+hw, pp.y-hw, pp.y+hw, pp.z, pp.z+self.player_height): check_obj(c, cp)
+        wm = self.world_manager
+        # The overlap query already found the landing candidates in mover/map order.
+        # Keep the original landing search limits and tie order, including the floor
+        # between movers and static blocks, at every finite player position.
+        movers = []; statics = []
+        for c in contacts:
+            (movers if wm.find_mover(c) is not None else statics).append(c)
+        for c in movers: check_obj(c)
         gf = self.world_manager.god_collision_floor
         if self.world_manager.god_floor_enabled:
             cp = gf.getPos(self.render)
@@ -179,10 +277,9 @@ class PlayerPhysics:
             sx, ex = int(round(pp.x - self.w/2)), int(round(pp.x + self.w/2))
             sy, ey = int(round(pp.y - self.w/2)), int(round(pp.y + self.w/2))
             sz = int(round(pp.z + 0.5))
-            for x in range(sx-1, ex+2):
-                for y in range(sy-1, ey+2):
-                    for z_chk in range(sz-2, sz+2):
-                        if c := self.world_manager.cube_map.get((x, y, z_chk)): check_obj(c)
+            for c in statics:
+                cp = c.getPos(self.render); x, y, z_chk = wm.get_grid_key(cp)
+                if sx-1 <= x < ex+2 and sy-1 <= y < ey+2 and sz-2 <= z_chk < sz+2: check_obj(c, cp)
         except: pass
 
         if g_cube is not None and g_cube.getTag("material") == "5" and self.vz < -4.0 and keys["space"]:
@@ -200,7 +297,7 @@ class PlayerPhysics:
             self.fall_peak_z=hgz
             self.player.setZ(hgz); self.vz = 0; self.ground = True
             return True
-        self.player.setPos(pp); self.ground = False
+        self.player.setPos(position); self.ground = False
         return False
 
     def bounce_heights(self, c, dt):
@@ -209,8 +306,7 @@ class PlayerPhysics:
         key = (b, mh, round(dt, 4))
         if (r := self.bounce_cache.get(key)) is None:
             r = self.bounce_cache[key] = self.sim_bounces(b, mh, min(dt, 0.1))
-        ceiling = 1000 - (c.getZ(self.render) + 0.5) # Out of bounds above z 1000 stops the player like a ceiling
-        return min(r[0], ceiling), min(r[1], ceiling)
+        return r
 
     def sim_bounces(self, b, mh, dt):
         """Bounce apexes with update()'s stepping (gravity applied before each frame's move), solved per flight instead of per frame."""
@@ -226,15 +322,14 @@ class PlayerPhysics:
             while z0 + dt * (k * v - gdt * k * (k + 1) / 2) >= 0: k += 1
             return k * gdt - v
         # The standing jump counts toward the highest point: weak trampolines bounce lower than it
-        v = impact(self.jump, 0.0); first = None; last = top = apex(self.jump, 0.0)
+        v = min(impact(self.jump, 0.0), self.max_fall_speed); first = None; last = top = apex(self.jump, 0.0)
         for _ in range(2000):
             if v <= 4.0: break # Too slow to bounce: the player lands and jumps again, repeating the same bounces
             launch = min(v * b, cap); h = apex(launch, 0.01)
             if first is None: first = h
             elif h <= last + 1e-6: break # No longer climbing
             last = h; top = max(top, h)
-            if top > 2000: return first, float('inf')
-            v = impact(launch, 0.01)
+            v = min(impact(launch, 0.01), self.max_fall_speed)
         return (first if first is not None else 0.0), top
 
     @staticmethod
@@ -267,7 +362,16 @@ class PlayerPhysics:
         crouching = keys.get("lshift", False) or keys.get("rshift", False)
 
         if self.flying:
-            v = VBase3(0,0,0); q = self.camera.getQuat(self.render); f = q.getForward(); f.setZ(0); f.normalize(); r = q.getRight(); r.setZ(0); r.normalize()
+            if not (keys["w"] or keys["s"] or keys["a"] or keys["d"] or keys["space"] or crouching): return
+            v = VBase3(0,0,0); q = self.camera.getQuat(self.render)
+            # The camera usually keeps its orientation across several physics
+            # steps. Reuse the exact normalized directions until it turns.
+            basis = getattr(self, 'fly_basis', None)
+            if basis is None or q != basis[0]:
+                f = q.getForward(); f.setZ(0); f.normalize()
+                r = q.getRight(); r.setZ(0); r.normalize()
+                self.fly_basis = (q, f, r)
+            else: _, f, r = basis
             if keys["w"]: v += f
             if keys["s"]: v -= f
             if keys["a"]: v -= r

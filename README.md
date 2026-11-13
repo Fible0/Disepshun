@@ -84,5 +84,6 @@ Legacy `.txt` / `.dmap` saves migrate automatically.
 
 ```sh
 python tests/test_regressions.py
+python -m unittest discover -s tests
 python tests/benchmark_performance.py
 ```

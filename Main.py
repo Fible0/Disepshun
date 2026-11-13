@@ -78,7 +78,7 @@ class Disepshun(EditorTools, ShowBase):
         
         if self.world.saved_checkpoint_pos:
             self.physics.checkpoint = self.world.saved_checkpoint_pos + VBase3(0, 0, 1)
-            self.physics.set_spawn_position(self.physics.checkpoint)
+            self.physics.set_spawn_position(self.physics.checkpoint, safe=True)
             ac = self.world.active_checkpoint_cube
             if ac is not None: self.physics.player.setH(float(ac.getTag("heading") or 0))
         
@@ -222,28 +222,41 @@ class Disepshun(EditorTools, ShowBase):
             if i >= len(ts): first.hide(); top.hide(); continue
             fh, mh = self.physics.bounce_heights(ts[i], dt)
             base = ts[i].getPos(self.render) + VBase3(0, 0, 0.5)
-            first.setPos(base + VBase3(0, 0, fh)); first.show()
+            if math.isfinite(fh): first.setPos(base + VBase3(0, 0, fh)); first.show()
+            else: first.hide()
             # When the first bounce is already the highest, one ghost marks both
-            top.setPos(base + VBase3(0, 0, mh))
-            if mh - fh > 0.01: top.show()
+            if math.isfinite(mh): top.setPos(base + VBase3(0, 0, mh))
+            if math.isfinite(mh) and mh - fh > 0.01: top.show()
             else: top.hide()
 
     PICK_FAR = 1000.0 # Camera far plane: selection and deletion reach anything visible
 
     def setup_ray(self):
         self.cTrav = CollisionTraverser(); self.cHandler = CollisionHandlerQueue()
-        # A segment along the view axis; its length is set per query, so build previews skip distant blocks.
-        self.pick_segment = CollisionSegment(0, 0, 0, 0, self.PICK_FAR, 0)
-        n = CollisionNode('mRay'); n.addSolid(self.pick_segment); n.setFromCollideMask(COLLIDABLE_MASK)
+        # Segment/box collisions can report the block's back face. A ray gives
+        # the entry face; finite bounds still skip blocks outside build reach.
+        self.pick_ray = CollisionRay(0, 0, 0, 0, 1, 0)
+        self.pick_length = self.PICK_FAR
+        self.pick_ray.setBounds(BoundingBox(Point3(0, 0, 0), Point3(0, self.pick_length, 0)))
+        n = CollisionNode('mRay'); n.addSolid(self.pick_ray); n.setFromCollideMask(COLLIDABLE_MASK)
+        n.setIntoCollideMask(BitMask32.allOff())
         self.picker = self.camera.attachNewNode(n); self.cTrav.addCollider(self.picker, self.cHandler)
 
     def traverse_pick(self, length=None):
-        """Collect blocks hit along the view axis, up to length (the camera far plane by default)."""
-        segment = getattr(self, 'pick_segment', None)
-        if segment is not None:
+        """Find the closest view-axis hit within reach (the camera far plane by default)."""
+        ray = getattr(self, 'pick_ray', None)
+        if ray is not None:
             length = self.PICK_FAR if length is None else float(length)
-            if segment.getPointB().y != length: segment.setPointB(0, length, 0)
+            if self.pick_length != length:
+                ray.setBounds(BoundingBox(Point3(0, 0, 0), Point3(0, length, 0)))
+                self.pick_length = length
         self.cTrav.traverse(self.render)
+        if ray is not None and self.cHandler.getNumEntries():
+            self.cHandler.sortEntries()
+            # Bounding volumes are conservative: the actual ray/box hit can
+            # fall just beyond the finite search volume.
+            if self.cHandler.getEntry(0).getSurfacePoint(self.picker).y > length:
+                self.cHandler.clearEntries()
 
     def setup_input(self):
         def bind_action(event, callback, args=None):
@@ -524,13 +537,17 @@ class Disepshun(EditorTools, ShowBase):
         if self.preview.getZ() < -19.5: return # Same world-height rule as block placement; visibility is only a display setting
         nodes=self.selected_objects or [m['np'] for m in self.selected_movers]
         if not nodes: return
+        pos = self.preview.getPos()
+        if self.selected_objects:
+            moving = [self.world.find_mover(c) for c in self.selected_objects]
+            origins = [m['origin'] for m in moving if m] + [c.getPos() for c,m in zip(self.selected_objects,moving) if not m]
+        else: origins = [m['origin'] for m in self.selected_movers]
+        off = pos - self.reference_point(origins)
+        if not self.valid_paths([origin+off for origin in origins]): return
         token=self.begin_edit(nodes)
         self.ensure_selected_movers()
-        pos = self.preview.getPos(); c = len(self.selected_movers)
+        c = len(self.selected_movers)
         if c > 0:
-            ref = self.reference_point([m['origin'] for m in self.selected_movers])
-
-            off = pos - ref
             for m in self.selected_movers: m['waypoints'].append(m['origin'] + off)
             self.finish_edit(token,[m['np'] for m in self.selected_movers],'waypoint_add')
             self.draw_wp(); self.world.touch(); self.world.queue_save(); self.play_block_action(True)
@@ -662,6 +679,11 @@ class Disepshun(EditorTools, ShowBase):
         while self.physics_time >= step:
             self.physics_time -= step
             self.physics.update(step, self.keyMap)
+            if self.physics.just_respawned:
+                # A respawn ends this frame's simulation, so a bad spawn cannot
+                # repeat its audio, particles and collision work in later substeps.
+                self.physics_time = 0.0
+                break
 
     def report_save_state(self, t):
         # Runs while paused or in the background too, so a queued or failed save is not held back.
@@ -690,6 +712,10 @@ class Disepshun(EditorTools, ShowBase):
         dt = globalClock.getDt(); t = globalClock.getFrameTime()
         self.report_save_state(t)
         if not foc: return task.cont
+        if getattr(self.physics, 'spawn_recovery_flight', False):
+            self.physics.spawn_recovery_flight = False
+            self.editor_notice('No safe checkpoint spawn; flight enabled. Move to safety or edit the map.')
+            self.play_sfx('power_on')
         self.ui.update_item_name(dt)
         self.ui.update_presence_status()
         fps = round(globalClock.getAverageFrameRate())
@@ -776,6 +802,8 @@ class Disepshun(EditorTools, ShowBase):
     def update_world(self, task):
         if self.paused or (self.is_focused is not None and not self.is_focused): return task.cont
         dt = globalClock.getDt()
+        movement_dt = min(dt, .1)
+        can_carry = not self.physics.flying and self.physics.vz <= 0
         carry = None; carry_top = -float('inf'); moved = {}; positions = []
         pp = self.physics.player.getPos()
         for m in self.world.moving_cubes:
@@ -786,10 +814,10 @@ class Disepshun(EditorTools, ShowBase):
             curr = m['np'].getPos()
 
             # Decide support before movement, then carry before player physics runs.
-            if not self.physics.flying and self.physics.vz <= 0 and abs(pp.x - curr.x) < 0.7 and abs(pp.y - curr.y) < 0.7 and curr.z + 0.45 <= pp.z <= curr.z + 0.6 and curr.z > carry_top:
+            if can_carry and abs(pp.x - curr.x) < 0.7 and abs(pp.y - curr.y) < 0.7 and curr.z + 0.45 <= pp.z <= curr.z + 0.6 and curr.z > carry_top:
                 carry = m; carry_top = curr.z
 
-            remaining = m['speed'] * min(dt, .1)
+            remaining = m['speed'] * movement_dt
             pos = VBase3(curr)
             # Remove complete circuits to keep large steps and duplicate points bounded.
             if circuit > 0: remaining %= circuit
@@ -810,8 +838,8 @@ class Disepshun(EditorTools, ShowBase):
                     m['current_idx'] = nxt
                 if remaining <= 0: break
             m['np'].setPos(pos)
-            new = m['np'].getPos(); positions.append(new)
-            moved[id(m)] = new - curr
+            positions.append(pos)
+            if can_carry: moved[id(m)] = pos - curr
 
         # Collision queries until the end of this frame look up movers by cell instead of scanning them all.
         # Movers sit directly under the untransformed platform holder, so local positions are world positions.
@@ -835,6 +863,7 @@ class Disepshun(EditorTools, ShowBase):
         if self.build_material == 0: return
         if self.preview.getZ() < -19.5: return
         pos = self.preview.getPos()
+        if not self.valid_block_position(pos): return
         
         k = self.world.get_grid_key(pos)
         if k in self.world.cube_map: return
@@ -851,6 +880,13 @@ class Disepshun(EditorTools, ShowBase):
         if self.cHandler.getNumEntries() > 0:
             self.cHandler.sortEntries(); target = self.world.find_mover(self.cHandler.getEntry(0).getIntoNodePath().getParent())
 
+        if target:
+            mp = target['np'].getPos(); off = pos - mp
+            off = VBase3(math.floor(off.x+0.5), math.floor(off.y+0.5), math.floor(off.z+0.5))
+            no = target['origin'] + off
+            nw = [no + (w - target['origin']) for w in target['waypoints']]
+            if not self.valid_block_position(mp+off) or not self.valid_paths([no]+nw): return
+
         token=self.begin_edit([])
         self.spawned_cube_count += 1
         c = self.world.get_cube(f"c_{self.spawned_cube_count}")
@@ -862,11 +898,8 @@ class Disepshun(EditorTools, ShowBase):
 
         if target:
             # Attach: the new block joins the targeted mover's path in lockstep; no other mover is touched
-            mc = target; mp = mc['np'].getPos(); off = pos - mp
-            off = VBase3(math.floor(off.x+0.5), math.floor(off.y+0.5), math.floor(off.z+0.5))
-            no = mc['origin'] + off
+            mc = target
             c.setPos(mp + off)
-            nw = [no + (w - mc['origin']) for w in mc['waypoints']]
             self.world.convert_to_mover(c, {'waypoints': nw, 'speed': mc['speed'], 'current_idx': mc['current_idx'], 'wait_timer': 0, 'origin': no, 'direction': mc.get('direction', 1), 'loop': mc.get('loop', False)})
         else:
             self.world.cubes.append(c); self.world.cube_map[k] = c

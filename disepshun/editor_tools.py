@@ -67,10 +67,14 @@ class EditorTools:
             nodes=[c for c in nodes if c.getTag('material')==('5' if self.tool_mode==8 else '4')]
         if self.tool_mode==11 and group: nodes=[c for c in nodes if c!=node]+[node]
         removing = node in self.selected_objects
+        # Keep the selection's insertion order without comparing every group member
+        # against an ever-growing list on large group selections.
         if removing:
-            self.selected_objects = [c for c in self.selected_objects if c not in nodes]
+            removed = set(nodes)
+            self.selected_objects = [c for c in self.selected_objects if c not in removed]
         else:
-            self.selected_objects.extend(c for c in nodes if c not in self.selected_objects)
+            selected = set(self.selected_objects)
+            self.selected_objects.extend(c for c in nodes if c not in selected)
         if self.tool_mode == 8:
             self.selected_trampolines = list(self.selected_objects)
             self.cur_bounce = float(node.getTag('bounciness') or 1.3)
@@ -145,17 +149,20 @@ class EditorTools:
                        if self.tool_mode==9 else [])
         if not checkpoints:
             if self.selection_node is not None: self.selection_node.removeNode()
-            self.selection_node=None; self.checkpoint_markers={}
+            self.selection_node=None; self.checkpoint_markers={}; self.checkpoint_marker_states={}
             return
         if not hasattr(self,'checkpoint_arrow_template'): self.checkpoint_arrow_template=self.make_checkpoint_arrow()
         if self.selection_node is None:
             self.selection_node=self.render.attachNewNode('checkpoint_directions')
             self.selection_node.setLightOff(); self.selection_node.setShaderOff()
             self.selection_node.setDepthTest(False); self.selection_node.setDepthWrite(False); self.selection_node.setBin('fixed',20)
-            self.checkpoint_markers={}
+            self.checkpoint_markers={}; self.checkpoint_marker_states={}
         markers=self.checkpoint_markers
-        for c in set(markers)-set(checkpoints): markers.pop(c).removeNode()
+        states=self.checkpoint_marker_states
+        for c in set(markers)-set(checkpoints):
+            markers.pop(c).removeNode(); states.pop(c,None)
         camera=getattr(self,'camera',self.physics.camera)
+        camera_pos=camera.getPos(self.render)
         for c in checkpoints:
             if c not in markers:
                 marker=self.selection_node.attachNewNode('checkpoint_facing')
@@ -164,10 +171,17 @@ class EditorTools:
                 self.checkpoint_arrow_template.instanceTo(outline)
                 fill=marker.attachNewNode('arrow_fill'); fill.setBin('fixed',20)
                 self.checkpoint_arrow_template.instanceTo(fill); markers[c]=marker
-            marker=markers[c]; pos=c.getPos(self.render)
-            marker.setPos(pos+VBase3(0,0,.95))
-            distance=(camera.getPos(self.render)-pos).length()
-            marker.setScale(max(1.0,min(3.0,distance/10))); marker.setH(float(c.getTag('heading') or 0)%360)
+            # Re-read live inputs, but leave unchanged transforms alone. Large
+            # checkpoint selections otherwise repeat three scene writes per frame.
+            marker=markers[c]; pos=c.getPos(self.render); heading=c.getTag('heading')
+            old=states.get(c)
+            moved=old is None or pos!=old[0]
+            if moved: marker.setPos(pos+VBase3(0,0,.95))
+            if moved or camera_pos!=old[1]:
+                distance=(camera_pos-pos).length()
+                marker.setScale(max(1.0,min(3.0,distance/10)))
+            if old is None or heading!=old[2]: marker.setH(float(heading or 0)%360)
+            if moved or camera_pos!=old[1] or heading!=old[2]: states[c]=(pos,camera_pos,heading)
 
     def reference_point(self, positions, grid_z=False):
         center=sum((VBase3(p) for p in positions),VBase3(0,0,0))/len(positions)
@@ -315,7 +329,10 @@ class EditorTools:
             for rec, pos in zip(self.clipboard, positions):
                 c = self.world._make_block(dict(rec, pos=pos))
                 if rec['heading']: c.setTag('heading', rec['heading'])
-                if rec['group']: c.setTag('group', groups.setdefault(rec['group'], uuid.uuid4().hex))
+                if rec['group']:
+                    group = rec['group']
+                    if group not in groups: groups[group] = uuid.uuid4().hex
+                    c.setTag('group', groups[group])
                 m = rec['mover']
                 if m:
                     self.world.convert_to_mover(c, dict(origin=m['origin']+delta, speed=m['speed'],
@@ -325,6 +342,11 @@ class EditorTools:
                     self.world.register_cube(c); self.world.request_chunk_update(pos)
                 nodes.append(c)
             self.selected_objects = nodes; self.commit_editor('paste',token)
+
+    def valid_block_position(self, pos):
+        if any(not math.isfinite(v) or abs(v)>self.world.COORD_LIMIT for v in pos) or pos.z < -19.5:
+            self.editor_notice('Objects must stay inside the map bounds'); return False
+        return True
 
     def valid_positions(self, positions, ignored):
         ignored = set(ignored)
@@ -345,13 +367,14 @@ class EditorTools:
             # Only cells whose keys can hold a centre within reach on every axis: static blocks
             # are keyed by floor(centre+0.5), movers and this edit's blocks by floor(centre).
             blocked = False
-            for x in range(floor(px+.5-r), floor(px+.5+r)+1):
-                for y in range(floor(py+.5-r), floor(py+.5+r)+1):
-                    for z in range(floor(pz+.5-r), floor(pz+.5+r)+1):
-                        c = statics.get((x, y, z))
-                        if c is not None and c not in ignored:
-                            q = c.getPos()
-                            if abs(px-q.x)<r and abs(py-q.y)<r and abs(pz-q.z)<r: blocked = True
+            if statics:
+                for x in range(floor(px+.5-r), floor(px+.5+r)+1):
+                    for y in range(floor(py+.5-r), floor(py+.5+r)+1):
+                        for z in range(floor(pz+.5-r), floor(pz+.5+r)+1):
+                            c = statics.get((x, y, z))
+                            if c is not None and c not in ignored:
+                                q = c.getPos()
+                                if abs(px-q.x)<r and abs(py-q.y)<r and abs(pz-q.z)<r: blocked = True
             if occupied and not blocked:
                 for x in range(floor(px-r), floor(px+r)+1):
                     for y in range(floor(py-r), floor(py+r)+1):
@@ -443,12 +466,14 @@ class EditorTools:
     def fill_corner(self):
         if self.input_blocked() or self.preview.getZ() < -19.5: return
         pos = VBase3(self.preview.getPos())
+        if not self.valid_block_position(pos): return
         first = getattr(self, 'fill_start', None)
         if first is None:
             self.fill_start = pos
             self.play_block_action(True)
             self.update_hud()
             return
+        if not self.valid_block_position(first): return
         lo = [min(round(first[i] - (.5 if i == 2 else 0)), round(pos[i] - (.5 if i == 2 else 0))) for i in range(3)]
         hi = [max(round(first[i] - (.5 if i == 2 else 0)), round(pos[i] - (.5 if i == 2 else 0))) for i in range(3)]
         count = math.prod(hi[i] - lo[i] + 1 for i in range(3))
@@ -458,22 +483,30 @@ class EditorTools:
             return
         token = self.begin_edit([])
         added = []
-        movers = {}
+        # Fill centres lie on an integer XY grid and half-integer Z grid.
+        # Mark the (at most eight) fill cells each mover can overlap once,
+        # rather than repeating a 27-cell spatial search for every new block.
+        mover_cells = set()
         for m in self.world.moving_cubes:
             q = m['np'].getPos()
-            movers.setdefault((math.floor(q.x), math.floor(q.y), math.floor(q.z)), []).append(q)
-        near = lambda p: (q for dx in (-1,0,1) for dy in (-1,0,1) for dz in (-1,0,1)
-                          for q in movers.get((math.floor(p.x)+dx, math.floor(p.y)+dy, math.floor(p.z)+dz), ()))
+            # Strict bounds retain the editor's existing .99 overlap threshold.
+            xs = range(max(lo[0], math.floor(q.x-.99)+1), min(hi[0]+1, math.ceil(q.x+.99)))
+            ys = range(max(lo[1], math.floor(q.y-.99)+1), min(hi[1]+1, math.ceil(q.y+.99)))
+            zs = range(max(lo[2], math.floor(q.z-.5-.99)+1), min(hi[2]+1, math.ceil(q.z-.5+.99)))
+            mover_cells.update((x,y,z) for x in xs for y in ys for z in zs)
         pp = self.physics.player.getPos()
         mode = getattr(self, 'fill_material', 1)
+        solid = getattr(self, 'fill_solid', True)
         for x in range(lo[0], hi[0]+1):
             for y in range(lo[1], hi[1]+1):
-                for z in range(lo[2], hi[2]+1):
-                    if not getattr(self, 'fill_solid', True) and not (x in (lo[0],hi[0]) or y in (lo[1],hi[1]) or z in (lo[2],hi[2])): continue
+                zs = range(lo[2], hi[2]+1)
+                if not solid and x not in (lo[0],hi[0]) and y not in (lo[1],hi[1]):
+                    zs = (lo[2],) if lo[2] == hi[2] else (lo[2],hi[2])
+                for z in zs:
                     p = VBase3(x, y, z+.5)
                     key = self.world.get_grid_key(p)
                     if key in self.world.cube_map: continue
-                    if movers and any(all(abs(p[i]-q[i]) < .99 for i in range(3)) for q in near(p)): continue
+                    if (x,y,z) in mover_cells: continue
                     if abs(pp.x-x) < .9 and abs(pp.y-y) < .9 and pp.z < z+1 and pp.z+self.physics.player_height > z: continue
                     mat = 1 + ((x+y+z) % 2) if mode == 6 else mode
                     c = self.world._make_block(dict(pos=p, mat=mat, bounce=self.cur_bounce, max_h=self.cur_h))

@@ -108,7 +108,7 @@ class WorldManager:
         self.chunks_visual = {}
         self.collision_chunks = {}
         self.chunk_format = GeomVertexFormat.getV3n3t2()
-        self.chunk_contents = {} # Chunk key -> insertion-ordered {block node: None}
+        self.chunk_contents = {} # 3D chunk key -> insertion-ordered {block node: None}
         self.static_cube_order = {}
         self.next_cube_order = 0
         self.dirty_chunks = set()
@@ -181,17 +181,20 @@ class WorldManager:
             cs = self.chunk_size
             for x in range(math.floor((camera_pos.x-radius-1)/cs), math.floor((camera_pos.x+radius+1)/cs)+1):
                 for y in range(math.floor((camera_pos.y-radius-1)/cs), math.floor((camera_pos.y+radius+1)/cs)+1):
-                    for c in self.chunk_contents.get((x,y), ()):
-                        if c.getTag('material') not in ('3','4'): continue
-                        d=(c.getPos(self.render)-camera_pos).lengthSquared()
-                        if d < 225: nearby.append((d,self.static_cube_order[c],c))
+                    for z in range(math.floor((camera_pos.z-radius-1)/cs), math.floor((camera_pos.z+radius+1)/cs)+1):
+                        for c in self.chunk_contents.get((x,y,z), ()):
+                            if c.getTag('material') not in ('3','4'): continue
+                            d=(c.getPos(self.render)-camera_pos).lengthSquared()
+                            if d < 225: nearby.append((d,self.static_cube_order[c],c))
             for i,m in enumerate(self.moving_cubes):
                 c=m['np']
                 if c.getTag('material') not in ('3','4'): continue
                 d=(c.getPos(self.render)-camera_pos).lengthSquared()
                 if d < 225: nearby.append((d,self.next_cube_order+i,c))
-            nearby.sort(key=lambda item:(item[0],item[1]))
-            self.glow_sources=[c for _,_,c in nearby[:len(self.glow_lights)]]
+            # The fixed light budget needs only the nearest few sources. The
+            # unique map-order field retains the full sort's tie breaking.
+            from heapq import nsmallest
+            self.glow_sources=[c for _,_,c in nsmallest(len(self.glow_lights),nearby)]
         for i,(light,node) in enumerate(self.glow_lights):
             c=self.glow_sources[i] if i<len(self.glow_sources) else None
             if c is None or c.isEmpty() or c.getParent().isEmpty() or c.getTag('material') not in ('3','4'):
@@ -230,19 +233,25 @@ class WorldManager:
         self.god_collision_floor.reparentTo(self.render); self.god_collision_floor.setPos(0, 0, -20.5)
 
     def get_chunk_key(self, pos):
-        return (int(pos.x) // self.chunk_size, int(pos.y) // self.chunk_size)
+        # Bound rebuilding work vertically too: a tall checkpoint column must
+        # not remesh its full height after every placement or activation.
+        cs = self.chunk_size
+        return (math.floor(pos.x/cs), math.floor(pos.y/cs), math.floor(pos.z/cs))
 
     def request_chunk_update(self, pos):
         key = self.get_chunk_key(pos)
         self.dirty_chunks.add(key)
-        
-        x, y = int(pos.x), int(pos.y)
-        lx, ly = x % self.chunk_size, y % self.chunk_size
-        
-        if lx == 0: self.dirty_chunks.add((key[0]-1, key[1]))
-        if lx == self.chunk_size - 1: self.dirty_chunks.add((key[0]+1, key[1]))
-        if ly == 0: self.dirty_chunks.add((key[0], key[1]-1))
-        if ly == self.chunk_size - 1: self.dirty_chunks.add((key[0], key[1]+1))
+        # Mesh faces use rounded logical neighbours, including legacy blocks
+        # off the build grid. Dirty their actual chunks on all six sides.
+        x,y,z = self.get_grid_key(pos)
+        cs = self.chunk_size
+        if (2 <= x-key[0]*cs <= cs-2 and 2 <= y-key[1]*cs <= cs-2 and
+                2 <= z-key[2]*cs <= cs-2): return
+        contents = self.chunk_contents.get(key, ())
+        for (nx,ny,nz),_ in self.FACE_DATA:
+            neighbor = self.cube_map.get((x+nx,y+ny,z+nz))
+            if neighbor is not None and neighbor not in contents:
+                self.dirty_chunks.add(self.get_chunk_key(neighbor.getPos()))
 
     def update_chunks(self, budget_seconds=None):
         if self.empty_chunks: self.prune_chunks()
@@ -283,24 +292,42 @@ class WorldManager:
     def rebuild_chunk(self, key):
         from array import array
         batches={}
+        records=[]; occupied=set()
         for c in self.chunk_contents.get(key, ()):
             if c.isHidden(): continue
-            pos=c.getPos(); x,y,z=self.get_grid_key(pos)
+            pos=c.getPos(); coords=self.get_grid_key(pos)
+            # Snapshot local visibility once. Interior blocks need no per-face
+            # traversal, and surface blocks can reuse these neighbor checks.
+            if self.cube_map.get(coords) == c: occupied.add(coords)
+            records.append((c,pos,coords))
+        lookup=self.cube_map.get
+        for c,pos,(x,y,z) in records:
+            if ((x,y-1,z) in occupied and (x,y+1,z) in occupied and
+                (x-1,y,z) in occupied and (x+1,y,z) in occupied and
+                (x,y,z+1) in occupied and (x,y,z-1) in occupied):
+                if not c.isStashed(): c.stash()
+                continue
             appearance=None
             visible=0
             for normal,corners in self.FACE_DATA:
                 nx,ny,nz=normal
-                neighbor=self.cube_map.get((x+nx,y+ny,z+nz))
+                neighbor_key=(x+nx,y+ny,z+nz)
+                if neighbor_key in occupied: continue
+                neighbor=lookup(neighbor_key)
                 if neighbor is not None and not neighbor.isHidden(): continue
                 # Interior blocks need no material/selection state or vertex data.
                 if appearance is None:
+                    px,py,pz=pos
                     color=tuple(c.getColor()); scale=tuple(c.getColorScale())
                     tint=c.getPythonTag('selection_color') if c.hasPythonTag('selection_color') else None
                     appearance=(c.getTag('material'),color,scale,c==self.active_checkpoint_cube,tint)
                 if appearance not in batches: batches[appearance]=(array('f'),array('I'),c)
                 vertices,indices,_=batches[appearance]; first=len(vertices)//8
-                for (dx,dy,dz),(u,v) in zip(corners,((0,0),(1,0),(1,1),(0,1))):
-                    vertices.extend((pos.x+dx,pos.y+dy,pos.z+dz,nx,ny,nz,u,v))
+                (dx0,dy0,dz0),(dx1,dy1,dz1),(dx2,dy2,dz2),(dx3,dy3,dz3)=corners
+                vertices.extend((px+dx0,py+dy0,pz+dz0,nx,ny,nz,0,0,
+                                 px+dx1,py+dy1,pz+dz1,nx,ny,nz,1,0,
+                                 px+dx2,py+dy2,pz+dz2,nx,ny,nz,1,1,
+                                 px+dx3,py+dy3,pz+dz3,nx,ny,nz,0,1))
                 indices.extend((first,first+1,first+2,first,first+2,first+3)); visible+=1
             if visible==0:
                 if not c.isStashed(): c.stash()
@@ -334,6 +361,13 @@ class WorldManager:
         contents = self.chunk_contents.get(k)
         if contents is None or cube not in contents: return
         del contents[cube]
+        # An edit can expose previously enclosed blocks before the budgeted mesh
+        # rebuild runs. Their logical colliders must become pickable immediately.
+        if cube.isStashed(): cube.unstash()
+        x,y,z = self.get_grid_key(cube.getPos())
+        for (nx,ny,nz),_ in self.FACE_DATA:
+            neighbor = self.cube_map.get((x+nx,y+ny,z+nz))
+            if neighbor is not None and neighbor.isStashed(): neighbor.unstash()
         if contents: return
         # Drop empty chunk bookkeeping so long sessions do not accumulate it. The collider holder may
         # still parent blocks mid-edit, so it is removed by prune_chunks once the edit has moved them.
@@ -365,8 +399,10 @@ class WorldManager:
                 cube.setTag("material", "")
                 cube.setTag("bounciness", "")
                 cube.setTag("max_height", "")
-                cube.getChildren().detach()
-                if cube.find("**/coll").isEmpty():
+                coll = cube.find("coll")
+                for child in cube.getChildren():
+                    if child != coll: child.detachNode()
+                if coll.isEmpty():
                     cn = CollisionNode("coll")
                     cn.addSolid(CollisionBox((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)))
                     cn.setIntoCollideMask(COLLIDABLE_MASK)
@@ -449,8 +485,12 @@ class WorldManager:
 
     def movers_near(self, min_x, max_x, min_y, max_y, min_z, max_z):
         """(node, position) of movers whose unit cube can overlap the box, in map order."""
+        count = len(self.moving_cubes)
+        if not count: return []
         index = self.mover_index
-        if index is not None and index[0] == self.block_version and index[1] == len(self.moving_cubes):
+        # For a handful of movers, checking them directly costs less than
+        # constructing and probing every spatial cell in the query box.
+        if count > 4 and index is not None and index[0] == self.block_version and index[1] == count:
             try:
                 xs = range(math.floor(min_x-.5), math.floor(max_x+.5)+1)
                 ys = range(math.floor(min_y-.5), math.floor(max_y+.5)+1)
@@ -490,7 +530,9 @@ class WorldManager:
             self.style_face(geom, cube)
             return
 
-        self.request_chunk_update(cube.getPos())
+        # Appearance changes do not expose neighbouring faces. Only geometry
+        # edits need the six-sided invalidation in request_chunk_update().
+        self.dirty_chunks.add(self.get_chunk_key(cube.getPos()))
 
     def convert_to_mover(self, c, mover):
         """Turn a live static block into a mover without recycling its node."""

@@ -1584,7 +1584,7 @@ def optimized_contacts(tmp):
             h=(.9,1.23,1.67)[i%3]
             ignore=tuple(w.cubes[:4]) if i%4==0 else ()
             floor,hits=p.get_contacts(pos,h,ignore)
-            if not (-10000<pos.x<10000 and -10000<pos.y<10000 and -1000<pos.z<1000):
+            if not all(math.isfinite(v) for v in pos):
                 assert floor and not hits; continue
             def overlap(c,half=.5):
                 cp=c.getPos(w.render)
